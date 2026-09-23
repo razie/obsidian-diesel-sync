@@ -363,10 +363,15 @@ export default class DieselSyncPlugin extends Plugin {
 
   midMarker(ver: number) { return `${this.s.markerClose} vs ${this.s.markerOpen} diesel v${ver}`; }
 
-  hasMarkers(text: string): boolean {
+  // 1-based line of the first leftover marker, or 0
+  markerLine(text: string): number {
     const o = `${this.s.markerOpen} obsidian`, m = `${this.s.markerClose} vs ${this.s.markerOpen} diesel`, e = `${this.s.markerClose} end`;
-    return lines(text).some((l) => l.trimEnd() === o || l.startsWith(m) || l.trimEnd() === e);
+    return lines(text).findIndex((l) => l.trimEnd() === o || l.startsWith(m) || l.trimEnd() === e) + 1;
   }
+
+  hasMarkers(text: string): boolean { return this.markerLine(text) > 0; }
+
+  unresolvedNotes: string[] = [];
 
   hunk(out: string[], a: string[], b: string[], ver: number) {
     out.push(`${this.s.markerOpen} obsidian`, ...a, this.midMarker(ver), ...b, `${this.s.markerClose} end`);
@@ -425,7 +430,10 @@ export default class DieselSyncPlugin extends Plugin {
     }
 
     // a note still carrying conflict markers is never pushed
-    if (this.hasMarkers(local)) return await this.unresolved(path, wpath, remote);
+    if (this.hasMarkers(local)) {
+      this.unresolvedNotes.push(`${path} (line ${this.markerLine(local)})`);
+      return await this.unresolved(path, wpath, remote);
+    }
 
     if (!st) return await this.conflict(path, wpath, local, remote, null);
 
@@ -515,6 +523,7 @@ export default class DieselSyncPlugin extends Plugin {
 
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
+      this.unresolvedNotes = [];
       const results: Record<string, number> = {};
       const errors: string[] = [];
       const initial: string[] = [];
@@ -543,11 +552,12 @@ export default class DieselSyncPlugin extends Plugin {
       }
       let msg = this.summarize(results, errors);
       if (initial.length) msg = `initial pull (${initial.join(", ")}) — ${msg}`;
+      if (this.unresolvedNotes.length) msg += `\nleftover conflict markers in:\n${this.unresolvedNotes.slice(0, 5).join("\n")}`;
       if (!pairs.length && !initial.length && !done.size) {
         msg += `. Nothing is linked yet: create a realm folder like ${this.s.rootFolder}/metals and sync again ` +
           `(pulls "${this.s.initialPullQuery}"), use "Pull topics by tag…", or add a folder mapping.`;
       }
-      if (!quiet || errors.length || results.conflict) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
+      if (!quiet || errors.length || results.conflict || results.unresolved) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
     });
   }
 
@@ -555,8 +565,9 @@ export default class DieselSyncPlugin extends Plugin {
     await this.run("syncing…", async () => {
       const w = this.wpathFor(f);
       if (!w) { new Notice('Diesel: not linked to a topic — use "Push current note"'); this.setStatus("idle"); return; }
+      this.unresolvedNotes = [];
       const o = await this.syncPair(f.path, w);
-      new Notice(`Diesel: ${w} — ${o}`);
+      new Notice(`Diesel: ${w} — ${o}` + (o === "unresolved" ? ` — leftover marker at line ${this.markerLine(await this.app.vault.read(f))}` : ""));
       this.setStatus(`${o} · ${w}`);
     });
   }
