@@ -2,6 +2,7 @@ import {
   App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder,
   normalizePath, requestUrl,
 } from "obsidian";
+import { diff3Merge, diffComm } from "node-diff3";
 
 // ---------- types ----------
 
@@ -25,6 +26,9 @@ interface Settings {
   wvis: string;
   autoSyncMinutes: number;  // 0 = off
   initialPullQuery: string; // tag query pulled into an empty <root>/<realm> folder, e.g. topic or topic/-hq
+  inlineConflicts: boolean; // merge conflicts into the note with markers (else: conflict copy only)
+  markerOpen: string;       // e.g. vvvvvvv
+  markerClose: string;      // e.g. ^^^^^^^
 }
 
 interface SyncState {
@@ -32,6 +36,7 @@ interface SyncState {
   ver: number;   // remote version at last sync
   hash: string;  // content hash at last sync (both sides equal then)
   at: number;
+  base?: boolean; // the last-synced text is stored in the base cache (for three-way merges)
 }
 
 interface PluginData {
@@ -44,7 +49,7 @@ interface Remote {
   content: string; ver: number; tags: string[];
 }
 
-type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "conflict" | "skipped" | "error";
+type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "skipped" | "error";
 
 const DEFAULTS: Settings = {
   user: "",
@@ -58,6 +63,9 @@ const DEFAULTS: Settings = {
   wvis: "Member",
   autoSyncMinutes: 0,
   initialPullQuery: "topic",
+  inlineConflicts: true,
+  markerOpen: "vvvvvvv",
+  markerClose: "^^^^^^^",
 };
 
 const CONFLICT_SUFFIX = ".diesel-conflict.md";
@@ -81,6 +89,12 @@ function hash(s: string): string {
 function parseWpath(wpath: string): { realm: string; category: string; name: string } | null {
   const m = wpath.trim().match(/^([^.:\s]+)\.([^.:\s]+):(.+)$/);
   return m ? { realm: m[1], category: m[2], name: m[3] } : null;
+}
+
+// split into lines, ignoring trailing newlines (the reactor may trim EOL)
+function lines(s: string): string[] {
+  const t = s.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+  return t === "" ? [] : t.split("\n");
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -316,8 +330,66 @@ export default class DieselSyncPlugin extends Plugin {
   }
 
   async record(path: string, wpath: string, ver: number, content: string) {
-    this.data.state[path] = { wpath, ver, hash: hash(content), at: Date.now() };
+    const h = hash(content);
+    const prev = this.data.state[path];
+    let base = !!(prev && prev.wpath === wpath && prev.hash === h && prev.base);
+    if (!base) { try { await this.writeBase(wpath, content); base = true; } catch { base = false; } }
+    this.data.state[path] = { wpath, ver, hash: h, at: Date.now(), base };
     await this.save();
+  }
+
+  // ---------- base cache: last-synced text per topic, for three-way merges ----------
+
+  baseDir(): string { return normalizePath(`${this.manifest?.dir ?? ".obsidian/plugins/diesel-sync"}/base`); }
+  basePath(wpath: string): string { return `${this.baseDir()}/${hash(wpath)}.md`; }
+
+  async writeBase(wpath: string, content: string) {
+    const a = this.app.vault.adapter;
+    const dir = this.baseDir();
+    if (!(await a.exists(dir))) await a.mkdir(dir);
+    await a.write(this.basePath(wpath), content);
+  }
+
+  async readBase(wpath: string, expectHash: string): Promise<string | null> {
+    try {
+      const a = this.app.vault.adapter, p = this.basePath(wpath);
+      if (!(await a.exists(p))) return null;
+      const b = await a.read(p);
+      return hash(b) === expectHash ? b : null; // stale base -> treat as missing
+    } catch { return null; }
+  }
+
+  // ---------- merge ----------
+
+  midMarker(ver: number) { return `${this.s.markerClose} vs ${this.s.markerOpen} diesel v${ver}`; }
+
+  hasMarkers(text: string): boolean {
+    const o = `${this.s.markerOpen} obsidian`, m = `${this.s.markerClose} vs ${this.s.markerOpen} diesel`, e = `${this.s.markerClose} end`;
+    return lines(text).some((l) => l.trimEnd() === o || l.startsWith(m) || l.trimEnd() === e);
+  }
+
+  hunk(out: string[], a: string[], b: string[], ver: number) {
+    out.push(`${this.s.markerOpen} obsidian`, ...a, this.midMarker(ver), ...b, `${this.s.markerClose} end`);
+  }
+
+  // three-way with the last-synced base: non-overlapping edits merge cleanly, overlaps get markers
+  merge3(local: string, base: string, remote: string, ver: number): { text: string; conflicts: number } {
+    const out: string[] = []; let conflicts = 0;
+    for (const blk of diff3Merge(lines(local), lines(base), lines(remote), { excludeFalseConflicts: true })) {
+      if (blk.ok) out.push(...blk.ok);
+      else if (blk.conflict) { conflicts++; this.hunk(out, blk.conflict.a, blk.conflict.b, ver); }
+    }
+    return { text: out.join("\n") + "\n", conflicts };
+  }
+
+  // no base: every difference is a hunk (can't tell an add on one side from a delete on the other)
+  merge2(local: string, remote: string, ver: number): { text: string; conflicts: number } {
+    const out: string[] = []; let conflicts = 0;
+    for (const blk of diffComm(lines(local), lines(remote))) {
+      if (blk.common) out.push(...blk.common);
+      else if (blk.buffer1.length || blk.buffer2.length) { conflicts++; this.hunk(out, blk.buffer1, blk.buffer2, ver); }
+    }
+    return { text: out.join("\n") + "\n", conflicts };
   }
 
   // ---------- sync core ----------
@@ -346,9 +418,16 @@ export default class DieselSyncPlugin extends Plugin {
     }
 
     const lh = hash(local), rh = hash(remote.content);
-    if (lh === rh) { await this.record(path, wpath, remote.ver, local); return "in-sync"; }
+    if (lh === rh) {
+      await this.record(path, wpath, remote.ver, local);
+      await this.dropConflictCopy(path);
+      return "in-sync";
+    }
 
-    if (!st) return await this.conflict(path, wpath, remote);
+    // a note still carrying conflict markers is never pushed
+    if (this.hasMarkers(local)) return await this.unresolved(path, wpath, remote);
+
+    if (!st) return await this.conflict(path, wpath, local, remote, null);
 
     const localChanged = lh !== st.hash;
     const remoteChanged = remote.ver !== st.ver && rh !== st.hash;
@@ -357,6 +436,7 @@ export default class DieselSyncPlugin extends Plugin {
       await this.write("update", wpath, local);
       const r = await this.confirm(wpath, remote.ver, lh);
       await this.record(path, wpath, r.ver, local);
+      await this.dropConflictCopy(path);
       return "pushed";
     }
     if (remoteChanged && !localChanged) {
@@ -364,15 +444,56 @@ export default class DieselSyncPlugin extends Plugin {
       await this.record(path, wpath, remote.ver, remote.content);
       return "pulled";
     }
-    return await this.conflict(path, wpath, remote);
+    return await this.conflict(path, wpath, local, remote, st);
   }
 
-  async conflict(path: string, wpath: string, remote: Remote): Promise<Outcome> {
+  async conflict(path: string, wpath: string, local: string, remote: Remote, st: SyncState | null): Promise<Outcome> {
     const cpath = path.replace(/\.md$/, CONFLICT_SUFFIX);
+    const cname = cpath.split("/").pop();
+
+    if (!this.s.inlineConflicts) {
+      await this.writeLocal(cpath, remote.content);
+      new Notice(`Diesel: conflict on ${wpath} — reactor copy saved as ${cname}. ` +
+        `Merge into your note, then run "keep local (force push)".`, 12000);
+      return "conflict";
+    }
+
+    const base = st ? await this.readBase(wpath, st.hash) : null;
+    const m = base !== null ? this.merge3(local, base, remote.content, remote.ver) : this.merge2(local, remote.content, remote.ver);
+
+    if (m.conflicts === 0) {
+      // clean three-way merge: both sides' edits combined
+      await this.writeLocal(path, m.text);
+      if (hash(m.text) === hash(remote.content)) {
+        await this.record(path, wpath, remote.ver, remote.content);
+        return "pulled";
+      }
+      await this.write("update", wpath, m.text);
+      const r = await this.confirm(wpath, remote.ver, hash(m.text));
+      await this.record(path, wpath, r.ver, m.text);
+      await this.dropConflictCopy(path);
+      return "merged";
+    }
+
+    // overlapping edits: markers in the note, reactor copy alongside. The reactor version becomes the
+    // base, so once the markers are gone the next sync pushes the resolution (or re-merges if it moved).
     await this.writeLocal(cpath, remote.content);
-    new Notice(`Diesel: conflict on ${wpath} — reactor copy saved as ${cpath.split("/").pop()}. ` +
-      `Merge into your note, then run "keep local (force push)".`, 12000);
+    await this.writeLocal(path, m.text);
+    await this.record(path, wpath, remote.ver, remote.content);
+    new Notice(`Diesel: conflict on ${wpath} — ${m.conflicts} hunk(s) marked in the note` +
+      (base === null ? " (no merge base: every difference is marked)" : "") +
+      `; reactor copy saved as ${cname}. Resolve the ${this.s.markerOpen} … ${this.s.markerClose} blocks, then sync.`, 12000);
     return "conflict";
+  }
+
+  async unresolved(path: string, wpath: string, remote: Remote): Promise<Outcome> {
+    const st = this.data.state[path];
+    if (st && remote.ver !== st.ver && hash(remote.content) !== st.hash) {
+      await this.writeLocal(path.replace(/\.md$/, CONFLICT_SUFFIX), remote.content);
+      new Notice(`Diesel: ${wpath} changed again on the reactor (v${remote.ver}) while the note has unresolved ` +
+        `conflict markers — conflict copy refreshed; resolve the markers, then sync to re-merge.`, 12000);
+    }
+    return "unresolved";
   }
 
   // ---------- commands ----------
@@ -516,6 +637,7 @@ export default class DieselSyncPlugin extends Plugin {
       const w = this.wpathFor(f);
       if (!w) throw new Error("not linked to a topic");
       const local = await this.app.vault.read(f);
+      if (this.hasMarkers(local)) throw new Error("the note still has conflict markers — resolve them first (or force pull to discard local)");
       const remote = await this.getRemote(w);
       await this.write(remote ? "update" : "create", w, local);
       const r = await this.confirm(w, remote?.ver ?? 0, hash(local));
@@ -599,6 +721,15 @@ class DieselSettingTab extends PluginSettingTab {
       .setDesc("When Sync all finds an empty realm folder under the root (e.g. Diesel/metals), it pulls this tag query. " +
         "Tags AND together, a leading - excludes, and a category name works as a tag: topic, topic/-hq, story. Empty = off.")
       .addText((t) => t.setValue(s.initialPullQuery).onChange(async (v) => { s.initialPullQuery = v.trim(); await save(); }));
+
+    containerEl.createEl("h3", { text: "Conflicts" });
+    new Setting(containerEl).setName("Merge conflicts into the note")
+      .setDesc("On: edits on both sides are three-way merged; overlapping hunks are marked in the note and the reactor copy is saved as " +
+        "<name>.diesel-conflict.md. A note with markers is never pushed. Off: conflict copy only.")
+      .addToggle((t) => t.setValue(s.inlineConflicts).onChange(async (v) => { s.inlineConflicts = v; await save(); }));
+    new Setting(containerEl).setName("Conflict markers").setDesc("Open / close markers (markdown-inert; avoid ===, >>> and ---).")
+      .addText((t) => t.setPlaceholder("vvvvvvv").setValue(s.markerOpen).onChange(async (v) => { s.markerOpen = v.trim() || DEFAULTS.markerOpen; await save(); }))
+      .addText((t) => t.setPlaceholder("^^^^^^^").setValue(s.markerClose).onChange(async (v) => { s.markerClose = v.trim() || DEFAULTS.markerClose; await save(); }));
 
     containerEl.createEl("h3", { text: "New topics and auto-sync" });
     new Setting(containerEl).setName("Visibility for new topics")

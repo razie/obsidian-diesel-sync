@@ -5,7 +5,18 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
 ## How it works
 
 - A note's body is the topic's content, byte for byte. The plugin adds no frontmatter; the note-to-topic link, last-synced version and content hash live in the plugin's data file.
-- On sync, each side is compared against the last sync: a local-only change is pushed, a remote-only change is pulled, and a change on both sides saves the reactor copy next to the note as `<name>.diesel-conflict.md`. Resolve with **Keep local (force push)** or **Take reactor copy (force pull)**.
+- On sync, each side is compared against the last sync: a local-only change is pushed, a remote-only change is pulled.
+- A change on both sides is three-way merged against the last-synced text (kept in `.obsidian/plugins/diesel-sync/base/`). Non-overlapping edits merge cleanly and the result is pushed. Overlapping hunks are marked in the note, and the reactor copy is saved next to it as `<name>.diesel-conflict.md`:
+
+  ```
+  vvvvvvv obsidian
+  your lines
+  ^^^^^^^ vs vvvvvvv diesel v14
+  reactor lines
+  ^^^^^^^ end
+  ```
+
+  The markers are markdown-inert (git's `=======` / `>>>>>>>` would render as a heading and a blockquote) and configurable. A note that still has markers is never pushed; once you've edited them out, the next sync pushes the resolution, or re-merges if the topic moved again meanwhile. Without a base (e.g. a note first paired with an existing, different topic) every difference is marked. **Keep local (force push)** and **Take reactor copy (force pull)** still work as escape hatches; force push refuses while markers remain. Turn inline merging off in settings to get the old conflict-copy-only behaviour.
 - Nothing is ever deleted on either side. Deleting a note only unlinks it.
 - If the reactor answers a read with a topic from a different realm (realm-inheritance fallback), the plugin refuses to write it.
 
@@ -33,6 +44,7 @@ Then set the reactor user and password in the plugin settings. They're stored in
 npm install
 npm run dev       # watch build to main.js
 npm run build     # typecheck + production build
+npm run test:merge  # offline merge unit tests
 DIESEL_AUTH=<base64 user:pass> npm run test:live   # end-to-end against metals, scratch topics tagged claude,test, cleaned up after
 ```
 

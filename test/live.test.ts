@@ -1,5 +1,5 @@
 import DieselSyncPlugin from "../src/main";
-import { Vault, TFile } from "obsidian";
+import { Vault, TFile, log } from "obsidian";
 const AUTH = process.env.DIESEL_AUTH; // base64 of user:pass
 if (!AUTH) { console.error("set DIESEL_AUTH=base64(user:pass)"); process.exit(1); }
 const [user, password] = Buffer.from(AUTH, "base64").toString().split(/:(.*)/s);
@@ -32,7 +32,8 @@ const PA = "Scratch/CT-ClaudeTestSyncA.md";
     await p.syncAll();
     const CP = PA.replace(".md", ".diesel-conflict.md");
     check("5 both edited -> conflict copy", vault.files.has(CP) && vault.files.get(CP)!.includes("remote both") && vault.files.get(PA)!.includes("local both"));
-    vault.files.set(PA, vault.files.get(PA)!.replace("local both\n", "remote both\nlocal both\n"));
+    check("5b overlap is marked inline", vault.files.get(PA)!.includes("vvvvvvv obsidian") && vault.files.get(PA)!.includes("remote both"));
+    vault.files.set(PA, vault.files.get(CP)! + "local both\n");
     await p.forcePush(vault.getAbstractFileByPath(PA) as TFile); r = await p.getRemote(A);
     check("6 force push resolves", !!r && r.content.includes("remote both\nlocal both") && !vault.files.has(CP));
     await p.syncAll();
@@ -42,6 +43,35 @@ const PA = "Scratch/CT-ClaudeTestSyncA.md";
     check("8 remote-only topic pulled to mapped path", pb === "Scratch/CT-ClaudeTestSyncB.md" && vault.files.get(pb)?.includes("remote only") === true, pb);
     let err = ""; try { await p.getRemote("metals.Topic:NoSuchTopicXyz"); } catch (e) { err = String(e); }
     check("9 missing topic reads as null", err === "");
+    // --- inline merge (0.3.0) ---
+    const edit = async (f: (c: string) => string) => { const x = await p.getRemote(A); await p.write("update", A, f(x!.content)); await p.confirm(A, x!.ver, ""); };
+    vault.files.set(PA, vault.files.get(PA)!.replace("line one", "line ONE local"));
+    await edit((c) => c + "remote tail\n");
+    let o = await p.syncPair(PA, A); r = await p.getRemote(A);
+    check("11 non-overlapping edits auto-merge", o === "merged" && vault.files.get(PA)!.includes("line ONE local") && vault.files.get(PA)!.includes("remote tail")
+      && r!.content.includes("line ONE local") && r!.content.includes("remote tail") && !vault.files.has(CP), o);
+    vault.files.set(PA, vault.files.get(PA)!.replace("line two local", "line two L"));
+    await edit((c) => c.replace("line two local", "line two R"));
+    o = await p.syncPair(PA, A); r = await p.getRemote(A);
+    const L = vault.files.get(PA)!;
+    check("12 overlapping edit -> markers + conflict copy", o === "conflict" && /vvvvvvv obsidian\nline two L\n\^{7} vs vvvvvvv diesel v\d+\nline two R\n\^{7} end/.test(L)
+      && vault.files.has(CP) && r!.content.includes("line two R") && !r!.content.includes("vvvvvvv"), o);
+    const ver12 = r!.ver;
+    o = await p.syncPair(PA, A); r = await p.getRemote(A);
+    check("13 marked note is not pushed", o === "unresolved" && r!.ver === ver12 && !r!.content.includes("vvvvvvv"), o);
+    await p.forcePush(vault.getAbstractFileByPath(PA) as TFile); r = await p.getRemote(A);
+    check("14 force push refused while markers remain", r!.ver === ver12 && log.some((m) => m.includes("conflict markers")));
+    vault.files.set(PA, L.replace(/vvvvvvv obsidian\n[\s\S]*?\^{7} end\n/, "line two LR\n"));
+    o = await p.syncPair(PA, A); r = await p.getRemote(A);
+    check("15 resolved note pushes, conflict copy dropped", o === "pushed" && r!.content.includes("line two LR") && !r!.content.includes("line two R\n") && !vault.files.has(CP), o);
+    vault.hidden.clear();
+    vault.files.set(PA, vault.files.get(PA)!.replace("# Sync A", "# Sync A local"));
+    await edit((c) => c + "remote again\n");
+    o = await p.syncPair(PA, A);
+    check("16 no base -> two-way, every difference marked", o === "conflict" && (vault.files.get(PA)!.match(/vvvvvvv obsidian/g) || []).length === 2 && log.some((m) => m.includes("no merge base")), o);
+    await p.forcePull(vault.getAbstractFileByPath(PA) as TFile); r = await p.getRemote(A);
+    check("17 force pull clears markers + copy", vault.files.get(PA) === r!.content && !vault.files.has(CP));
+
     const st = p.data.state[PA]; await vault.handlers.rename({ path: "Scratch/CT-Renamed.md" }, PA);
     check("10 rename keeps link", p.data.state["Scratch/CT-Renamed.md"]?.wpath === A && !p.data.state[PA]);
   } finally {

@@ -16,6 +16,14 @@ export class TFile extends TAbstractFile {
 }
 export class Vault {
   files = new Map<string, string>(); folders = new Set<string>(); handlers: any = {};
+  hidden = new Map<string, string>(); // adapter-only files (plugin dir)
+  adapter = {
+    exists: async (p: string) => this.hidden.has(p) || [...this.hidden.keys()].some((k) => k.startsWith(p + "/")) || p.endsWith("/base"),
+    mkdir: async (_: string) => {},
+    read: async (p: string) => { if (!this.hidden.has(p)) throw new Error("ENOENT " + p); return this.hidden.get(p)!; },
+    write: async (p: string, c: string) => { this.hidden.set(p, c); },
+    remove: async (p: string) => { this.hidden.delete(p); },
+  };
   getAbstractFileByPath(p: string) {
     if (this.files.has(p)) { const f = new TFile(p); const d = p.split("/").slice(0,-1).join("/"); f.parent = d ? new TFolder(d) : new TFolder(""); return f; }
     if (this.folders.has(p)) {
@@ -37,7 +45,7 @@ export class Vault {
 }
 export class Plugin {
   stored: any = null;
-  constructor(public app: any) {}
+  constructor(public app: any, public manifest: any = {}) {}
   async loadData() { return this.stored; } async saveData(d: any) { this.stored = JSON.parse(JSON.stringify(d)); }
   addStatusBarItem() { return { setText: (_: string) => {} }; }
   addRibbonIcon() {} addCommand() {} addSettingTab() {} registerEvent() {}
