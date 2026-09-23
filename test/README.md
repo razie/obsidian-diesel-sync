@@ -1,0 +1,1 @@
+`live.test.ts` runs the real sync logic against the live metals reactor with an in-memory Obsidian mock (`obsidian-mock.ts`). It creates scratch topics `metals.Topic:ClaudeTestSyncA/B` tagged `claude,test` and deletes them at the end.

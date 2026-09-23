@@ -1,0 +1,26 @@
+{
+  "name": "diesel-sync",
+  "version": "0.1.0",
+  "description": "Obsidian plugin: two-way sync of notes with topics on DieselApps reactors",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test:live": "esbuild test/live.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/live.js --log-level=warning && node test/.out/live.js",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": [
+    "obsidian",
+    "dieselapps",
+    "sync"
+  ],
+  "author": "Razie",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "builtin-modules": "^5.4.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "typescript": "^5.6.0"
+  }
+}

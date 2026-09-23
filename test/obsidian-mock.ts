@@ -1,0 +1,42 @@
+(globalThis as any).window = globalThis;
+export const log: string[] = [];
+export class Notice { constructor(m: string) { log.push(m); console.log("  [notice]", m.replace(/\n/g," | ")); } }
+export function normalizePath(p: string) { return p.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/"); }
+export async function requestUrl(o: any) {
+  const headers: any = { ...(o.headers || {}) }; if (o.contentType) headers["Content-Type"] = o.contentType;
+  const r = await fetch(o.url, { method: o.method || "GET", headers, body: o.body });
+  const text = await r.text();
+  return { status: r.status, text, get json() { return JSON.parse(text); } };
+}
+export class TAbstractFile { constructor(public path: string) {} get name() { return this.path.split("/").pop()!; } parent: any = null; }
+export class TFolder extends TAbstractFile {}
+export class TFile extends TAbstractFile {
+  get extension() { return this.name.split(".").pop()!; }
+  get basename() { return this.name.replace(/\.[^.]+$/, ""); }
+}
+export class Vault {
+  files = new Map<string, string>(); folders = new Set<string>(); handlers: any = {};
+  getAbstractFileByPath(p: string) {
+    if (this.files.has(p)) { const f = new TFile(p); const d = p.split("/").slice(0,-1).join("/"); f.parent = d ? new TFolder(d) : new TFolder(""); return f; }
+    if (this.folders.has(p)) return new TFolder(p); return null;
+  }
+  async read(f: TFile) { return this.files.get(f.path)!; }
+  async modify(f: TFile, c: string) { this.files.set(f.path, c); }
+  async create(p: string, c: string) { this.files.set(p, c); return this.getAbstractFileByPath(p) as TFile; }
+  async createFolder(p: string) { this.folders.add(p); }
+  async trash(f: TFile) { this.files.delete(f.path); }
+  getMarkdownFiles() { return [...this.files.keys()].filter(p => p.endsWith(".md")).map(p => this.getAbstractFileByPath(p) as TFile); }
+  on(ev: string, fn: any) { this.handlers[ev] = fn; return {}; }
+}
+export class Plugin {
+  stored: any = null;
+  constructor(public app: any) {}
+  async loadData() { return this.stored; } async saveData(d: any) { this.stored = JSON.parse(JSON.stringify(d)); }
+  addStatusBarItem() { return { setText: (_: string) => {} }; }
+  addRibbonIcon() {} addCommand() {} addSettingTab() {} registerEvent() {}
+  registerInterval(id: any) { return id; }
+}
+export class Modal { constructor(public app: any) {} }
+export class PluginSettingTab { constructor(public app: any, public plugin: any) {} }
+export class Setting {}
+export type App = any;
