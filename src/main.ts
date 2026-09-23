@@ -24,6 +24,7 @@ interface Settings {
   visibility: string;       // for newly created topics
   wvis: string;
   autoSyncMinutes: number;  // 0 = off
+  initialPullQuery: string; // tag query pulled into an empty <root>/<realm> folder, e.g. topic or topic/-hq
 }
 
 interface SyncState {
@@ -56,6 +57,7 @@ const DEFAULTS: Settings = {
   visibility: "Member",
   wvis: "Member",
   autoSyncMinutes: 0,
+  initialPullQuery: "topic",
 };
 
 const CONFLICT_SUFFIX = ".diesel-conflict.md";
@@ -392,20 +394,39 @@ export default class DieselSyncPlugin extends Plugin {
 
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
+      const results: Record<string, number> = {};
+      const errors: string[] = [];
+      const initial: string[] = [];
+      const done = new Set<string>();
+      const q = this.s.initialPullQuery.split("/").map((x) => x.trim()).filter(Boolean);
+      if (q.length) {
+        for (const realm of this.emptyRealmFolders()) {
+          try {
+            const wpaths = await this.tagQuery(realm, q);
+            initial.push(`${realm}: ${wpaths.length}`);
+            this.setStatus(`initial pull ${realm} (${wpaths.length})…`);
+            await this.syncList(wpaths, results, errors);
+            wpaths.forEach((w) => done.add(w));
+          } catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
+        }
+      }
       const pairs: [string, string][] = [];
-      const seen = new Set<string>();
+      const seen = new Set<string>(done);
       for (const f of this.app.vault.getMarkdownFiles()) {
         const w = this.wpathFor(f);
         if (w && !seen.has(w)) { pairs.push([f.path, w]); seen.add(w); }
       }
-      const results: Record<string, number> = {};
-      const errors: string[] = [];
       for (const [path, w] of pairs) {
         try { const o = await this.syncPair(path, w); results[o] = (results[o] ?? 0) + 1; }
         catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
       }
-      const msg = this.summarize(results, errors);
-      if (!quiet || errors.length || results.conflict) new Notice(`Diesel: ${msg}`, errors.length ? 12000 : 5000);
+      let msg = this.summarize(results, errors);
+      if (initial.length) msg = `initial pull (${initial.join(", ")}) — ${msg}`;
+      if (!pairs.length && !initial.length && !done.size) {
+        msg += `. Nothing is linked yet: create a realm folder like ${this.s.rootFolder}/metals and sync again ` +
+          `(pulls "${this.s.initialPullQuery}"), use "Pull topics by tag…", or add a folder mapping.`;
+      }
+      if (!quiet || errors.length || results.conflict) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
     });
   }
 
@@ -448,26 +469,46 @@ export default class DieselSyncPlugin extends Plugin {
   }
 
   pullTagPrompt() {
-    new PromptModal(this.app, "Pull by tag: realm/tag1/tag2 (AND)", `${this.s.defaultRealm}/`, async (q) => {
+    new PromptModal(this.app, "Pull by tag: realm/tag1/tag2 (AND; -tag excludes)", `${this.s.defaultRealm}/`, async (q) => {
       const [realm, ...tags] = q.split("/").map((x) => x.trim()).filter(Boolean);
       if (!realm || !tags.length) { new Notice("Diesel: expected realm/tag"); return; }
       await this.run("pulling…", async () => {
-        const r = await requestUrl({
-          url: `${this.baseUrl(realm)}/api/v1/wiki/tag/${tags.map(encodeURIComponent).join("/")}`,
-          headers: this.auth(), throw: false,
-        });
-        if (r.status === 404) { new Notice("Diesel: no topics with that tag"); this.setStatus("idle"); return; }
-        if (r.status !== 200) throw new Error(`tag query: HTTP ${r.status}`);
-        const wpaths: string[] = (r.json?.data ?? []).map((x: { wpath: string }) => x.wpath).filter((w: string) => parseWpath(w));
+        const wpaths = await this.tagQuery(realm, tags);
+        if (!wpaths.length) { new Notice("Diesel: no topics match that tag query"); this.setStatus("idle"); return; }
         const results: Record<string, number> = {};
         const errors: string[] = [];
-        for (const w of wpaths) {
-          try { const o = await this.syncPair(this.pathFor(w), w); results[o] = (results[o] ?? 0) + 1; }
-          catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
-        }
+        await this.syncList(wpaths, results, errors);
         new Notice(`Diesel: ${wpaths.length} topic(s) — ${this.summarize(results, errors)}`, 8000);
       });
     }).open();
+  }
+
+  // tags AND together; a leading "-" excludes (e.g. ["topic", "-hq"]); a category name works as a tag
+  async tagQuery(realm: string, tags: string[]): Promise<string[]> {
+    const r = await requestUrl({
+      url: `${this.baseUrl(realm)}/api/v1/wiki/tag/${tags.map(encodeURIComponent).join("/")}`,
+      headers: this.auth(), throw: false,
+    });
+    if (r.status === 404) return [];
+    if (r.status !== 200) throw new Error(`tag query ${realm}/${tags.join("/")}: HTTP ${r.status}`);
+    return (r.json?.data ?? []).map((x: { wpath: string }) => x.wpath)
+      .filter((w: string) => { const p = parseWpath(w); return p && p.realm === realm; });
+  }
+
+  async syncList(wpaths: string[], results: Record<string, number>, errors: string[]) {
+    for (const w of wpaths) {
+      try { const o = await this.syncPair(this.pathFor(w), w); results[o] = (results[o] ?? 0) + 1; }
+      catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
+    }
+  }
+
+  // realm folders under the root that hold no notes yet -> candidates for the initial pull
+  emptyRealmFolders(): string[] {
+    const root = this.app.vault.getAbstractFileByPath(normalizePath(this.s.rootFolder));
+    if (!(root instanceof TFolder)) return [];
+    const hasNote = (f: TFolder): boolean =>
+      f.children.some((c) => (c instanceof TFile && c.extension === "md") || (c instanceof TFolder && hasNote(c)));
+    return root.children.filter((c): c is TFolder => c instanceof TFolder && !hasNote(c)).map((c) => c.name);
   }
 
   async forcePush(f: TFile) {
@@ -553,6 +594,11 @@ class DieselSettingTab extends PluginSettingTab {
       .setDesc("One per line: folder | realm.Category | filename prefix | tags for new topics. " +
         "Example: RazInvest/Cards | metals.CompanyCard | Card- | card")
       .addTextArea((t) => { t.inputEl.rows = 4; t.setValue(s.mappings).onChange(async (v) => { s.mappings = v; await save(); }); });
+
+    new Setting(containerEl).setName("Initial pull query")
+      .setDesc("When Sync all finds an empty realm folder under the root (e.g. Diesel/metals), it pulls this tag query. " +
+        "Tags AND together, a leading - excludes, and a category name works as a tag: topic, topic/-hq, story. Empty = off.")
+      .addText((t) => t.setValue(s.initialPullQuery).onChange(async (v) => { s.initialPullQuery = v.trim(); await save(); }));
 
     containerEl.createEl("h3", { text: "New topics and auto-sync" });
     new Setting(containerEl).setName("Visibility for new topics")

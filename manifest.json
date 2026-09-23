@@ -1,9 +1,9 @@
 {
-  "id": "diesel-sync",
-  "name": "Diesel Sync",
-  "version": "0.1.0",
-  "minAppVersion": "1.4.0",
-  "description": "Two-way sync of notes with topics on DieselApps reactors (dieselapps.com).",
-  "author": "Razie",
-  "isDesktopOnly": false
+	"id": "diesel-sync",
+	"name": "Diesel Sync",
+	"version": "0.2.0",
+	"minAppVersion": "1.4.0",
+	"description": "Two-way sync of notes with topics on DieselApps reactors (dieselapps.com).",
+	"author": "Razie",
+	"isDesktopOnly": false
 }
