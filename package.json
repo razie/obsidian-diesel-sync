@@ -1,6 +1,6 @@
 {
   "name": "diesel-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Obsidian plugin: two-way sync of notes with topics on DieselApps reactors",
   "main": "main.js",
   "scripts": {
