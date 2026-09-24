@@ -4,7 +4,7 @@ const AUTH = process.env.DIESEL_AUTH; // base64 of user:pass
 if (!AUTH) { console.error("set DIESEL_AUTH=base64(user:pass)"); process.exit(1); }
 const [user, password] = Buffer.from(AUTH, "base64").toString().split(/:(.*)/s);
 const vault = new Vault();
-const app = { vault, workspace: { getActiveFile: () => null, getLeaf: () => ({ openFile: async () => {} }) } };
+const app = { vault, workspace: { on: () => ({}), getActiveFile: () => null, getLeaf: () => ({ openFile: async () => {} }) } };
 const p = new DieselSyncPlugin(app as any, {} as any);
 let pass = 0, fail = 0;
 const check = (name: string, ok: boolean, extra = "") => { ok ? pass++ : fail++; console.log(`${ok ? "PASS" : "FAIL"} ${name} ${extra}`); };
@@ -71,6 +71,21 @@ const PA = "Scratch/CT-ClaudeTestSyncA.md";
     check("16 no base -> two-way, every difference marked", o === "conflict" && (vault.files.get(PA)!.match(/vvvvvvv obsidian/g) || []).length === 2 && log.some((m) => m.includes("no merge base")), o);
     await p.forcePull(vault.getAbstractFileByPath(PA) as TFile); r = await p.getRemote(A);
     check("17 force pull clears markers + copy", vault.files.get(PA) === r!.content && !vault.files.has(CP));
+
+    // --- sync only local edits (0.3.2) ---
+    p.s.syncOnlyLocalEdits = true; p.dirty.clear();
+    vault.files.set(PA, "via obsidian sync\n" + vault.files.get(PA)!); // written, not typed here
+    await edit((c) => c + "remote meanwhile\n");
+    let r0 = await p.getRemote(A);
+    o = await p.syncPair(PA, A); r = await p.getRemote(A);
+    check("18 untyped local change left alone", o === "elsewhere" && r!.ver === r0!.ver && !vault.files.get(PA)!.includes("vvvvvvv"), o);
+    p.dirty.add(PA);
+    o = await p.syncPair(PA, A); r = await p.getRemote(A);
+    check("19 typed here -> merged + dirty cleared", o === "merged" && r!.content.includes("via obsidian sync") && r!.content.includes("remote meanwhile") && !p.dirty.has(PA), o);
+    await edit((c) => c + "diesel web edit\n");
+    o = await p.syncPair(PA, A);
+    check("20 remote-only change still pulls", o === "pulled" && vault.files.get(PA)!.includes("diesel web edit"), o);
+    p.s.syncOnlyLocalEdits = false;
 
     const st = p.data.state[PA]; await vault.handlers.rename({ path: "Scratch/CT-Renamed.md" }, PA);
     check("10 rename keeps link", p.data.state["Scratch/CT-Renamed.md"]?.wpath === A && !p.data.state[PA]);

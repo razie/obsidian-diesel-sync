@@ -26,6 +26,7 @@ interface Settings {
   wvis: string;
   autoSyncMinutes: number;  // 0 = off
   initialPullQuery: string; // tag query pulled into an empty <root>/<realm> folder, e.g. topic or topic/-hq
+  syncOnlyLocalEdits: boolean; // only push/merge notes typed on this device (multi-device Obsidian Sync)
   inlineConflicts: boolean; // merge conflicts into the note with markers (else: conflict copy only)
   markerOpen: string;       // e.g. vvvvvvv
   markerClose: string;      // e.g. ^^^^^^^
@@ -49,7 +50,7 @@ interface Remote {
   content: string; ver: number; tags: string[];
 }
 
-type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "skipped" | "error";
+type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "error";
 
 const DEFAULTS: Settings = {
   user: "",
@@ -63,6 +64,7 @@ const DEFAULTS: Settings = {
   wvis: "Member",
   autoSyncMinutes: 0,
   initialPullQuery: "topic",
+  syncOnlyLocalEdits: false,
   inlineConflicts: true,
   markerOpen: "vvvvvvv",
   markerClose: "^^^^^^^",
@@ -156,11 +158,20 @@ export default class DieselSyncPlugin extends Plugin {
 
     // keep sync state attached to files when they move; forget it when they're deleted (no remote delete)
     this.registerEvent(this.app.vault.on("rename", async (f, oldPath) => {
+      if (this.dirty.delete(oldPath)) { this.dirty.add(f.path); this.saveDirty(); }
       const st = this.data.state[oldPath];
       if (st) { delete this.data.state[oldPath]; this.data.state[f.path] = st; await this.save(); }
     }));
     this.registerEvent(this.app.vault.on("delete", async (f) => {
+      if (this.dirty.delete(f.path)) this.saveDirty();
       if (this.data.state[f.path]) { delete this.data.state[f.path]; await this.save(); }
+    }));
+
+    // notes typed in on THIS device (editor-change never fires for Obsidian Sync / external writes)
+    this.loadDirty();
+    this.registerEvent(this.app.workspace.on("editor-change", (_e, info) => {
+      const path = info?.file?.path;
+      if (path && path.endsWith(".md") && !this.dirty.has(path)) { this.dirty.add(path); this.saveDirty(); }
     }));
 
     this.resetTimer();
@@ -169,6 +180,13 @@ export default class DieselSyncPlugin extends Plugin {
   onunload() { if (this.timer) window.clearInterval(this.timer); }
 
   async save() { await this.saveData(this.data); }
+
+  // per-device (not in data.json, which Obsidian Sync shares between devices)
+  dirty = new Set<string>();
+  loadDirty() {
+    try { const v = this.app.loadLocalStorage?.("diesel-sync-dirty"); this.dirty = new Set(Array.isArray(v) ? v : []); } catch { /* none */ }
+  }
+  saveDirty() { try { this.app.saveLocalStorage?.("diesel-sync-dirty", [...this.dirty]); } catch { /* best effort */ } }
 
   get s() { return this.data.settings; }
 
@@ -336,6 +354,10 @@ export default class DieselSyncPlugin extends Plugin {
     if (!base) { try { await this.writeBase(wpath, content); base = true; } catch { base = false; } }
     this.data.state[path] = { wpath, ver, hash: h, at: Date.now(), base };
     await this.save();
+    if (this.dirty.has(path)) { // clear only if nothing was typed while we were syncing
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (f instanceof TFile && hash(await this.app.vault.read(f)) === h) { this.dirty.delete(path); this.saveDirty(); }
+    }
   }
 
   // ---------- base cache: last-synced text per topic, for three-way merges ----------
@@ -407,6 +429,11 @@ export default class DieselSyncPlugin extends Plugin {
     const st = this.data.state[path];
 
     if (local === null && remote === null) return "skipped";
+
+    // "sync only local edits": a local change nobody typed here came from another device (Obsidian Sync);
+    // that device pushes it — don't push, merge or conflict on it from here
+    if (local !== null && this.s.syncOnlyLocalEdits && !this.dirty.has(path) && (!st || hash(local) !== st.hash)
+        && !(remote && hash(remote.content) === hash(local))) return "elsewhere";
 
     if (remote === null) {
       if (st) { new Notice(`Diesel: ${wpath} is gone from the reactor — local note kept, nothing deleted`); return "skipped"; }
@@ -732,6 +759,11 @@ class DieselSettingTab extends PluginSettingTab {
       .setDesc("When Sync all finds an empty realm folder under the root (e.g. Diesel/metals), it pulls this tag query. " +
         "Tags AND together, a leading - excludes, and a category name works as a tag: topic, topic/-hq, story. Empty = off.")
       .addText((t) => t.setValue(s.initialPullQuery).onChange(async (v) => { s.initialPullQuery = v.trim(); await save(); }));
+
+    new Setting(containerEl).setName("Sync only local edits")
+      .setDesc("Avoid multi-obsidian sync issues: with Obsidian Sync on several devices, only notes typed in on this device are " +
+        "pushed or merged; changes arriving from other devices are left to them. Off: every change syncs, as before.")
+      .addToggle((t) => t.setValue(s.syncOnlyLocalEdits).onChange(async (v) => { s.syncOnlyLocalEdits = v; await save(); }));
 
     containerEl.createEl("h3", { text: "Conflicts" });
     new Setting(containerEl).setName("Merge conflicts into the note")

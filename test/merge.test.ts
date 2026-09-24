@@ -1,7 +1,7 @@
 import DieselSyncPlugin from "../src/main";
 import { Vault } from "obsidian";
 // offline: merge logic only
-const p = new DieselSyncPlugin({ vault: new Vault(), workspace: {} } as any, {} as any);
+const p = new DieselSyncPlugin({ vault: new Vault(), workspace: { on: () => ({}) } } as any, {} as any);
 let pass = 0, fail = 0;
 const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; console.log(`${ok ? "PASS" : "FAIL"} ${n} ${x}`); };
 (async () => {
