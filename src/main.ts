@@ -26,6 +26,7 @@ interface Settings {
   wvis: string;
   autoSyncMinutes: number;  // 0 = off
   initialPullQuery: string; // tag query pulled into an empty <root>/<realm> folder, e.g. topic or topic/-hq
+  pullNewTopics: boolean;      // every sync: pull topics matching the pull query that aren't in the vault yet
   syncOnlyLocalEdits: boolean; // only push/merge notes typed on this device (multi-device Obsidian Sync)
   inlineConflicts: boolean; // merge conflicts into the note with markers (else: conflict copy only)
   markerOpen: string;       // e.g. vvvvvvv
@@ -43,6 +44,7 @@ interface SyncState {
 interface PluginData {
   settings: Settings;
   state: Record<string, SyncState>; // key: vault path
+  ignored: string[]; // wpaths whose synced note was deleted locally: not re-pulled as "new" (Pull by tag still fetches them)
 }
 
 interface Remote {
@@ -64,6 +66,7 @@ const DEFAULTS: Settings = {
   wvis: "Member",
   autoSyncMinutes: 0,
   initialPullQuery: "topic",
+  pullNewTopics: true,
   syncOnlyLocalEdits: false,
   inlineConflicts: true,
   markerOpen: "vvvvvvv",
@@ -118,6 +121,7 @@ export default class DieselSyncPlugin extends Plugin {
     this.data = {
       settings: Object.assign({}, DEFAULTS, raw?.settings ?? {}),
       state: raw?.state ?? {},
+      ignored: raw?.ignored ?? [],
     };
 
     this.statusEl = this.addStatusBarItem();
@@ -164,7 +168,12 @@ export default class DieselSyncPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("delete", async (f) => {
       if (this.dirty.delete(f.path)) this.saveDirty();
-      if (this.data.state[f.path]) { delete this.data.state[f.path]; await this.save(); }
+      const st = this.data.state[f.path];
+      if (st) {
+        delete this.data.state[f.path];
+        if (!this.data.ignored.includes(st.wpath)) this.data.ignored.push(st.wpath);
+        await this.save();
+      }
     }));
 
     // notes typed in on THIS device (editor-change never fires for Obsidian Sync / external writes)
@@ -573,18 +582,35 @@ export default class DieselSyncPlugin extends Plugin {
         const w = this.wpathFor(f);
         if (w && !seen.has(w)) { pairs.push([f.path, w]); seen.add(w); }
       }
+      // topics created on the reactor since the initial pull
+      const fresh: string[] = [];
+      if (q.length && this.s.pullNewTopics) {
+        const initialRealms = new Set(initial.map((x) => x.split(":")[0]));
+        for (const realm of this.realmFolders().filter((r) => !initialRealms.has(r))) {
+          try {
+            const news = (await this.tagQuery(realm, q)).filter((w) => !seen.has(w) && !this.data.ignored.includes(w));
+            if (!news.length) continue;
+            this.setStatus(`pulling ${news.length} new topic(s) for ${realm}…`);
+            const before = results.pulled ?? 0;
+            await this.syncList(news, results, errors);
+            news.forEach((w) => seen.add(w));
+            if ((results.pulled ?? 0) > before) fresh.push(...news.map((w) => w.split(":").pop()!));
+          } catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
+        }
+      }
       for (const [path, w] of pairs) {
         try { const o = await this.syncPair(path, w); results[o] = (results[o] ?? 0) + 1; }
         catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
       }
       let msg = this.summarize(results, errors);
       if (initial.length) msg = `initial pull (${initial.join(", ")}) — ${msg}`;
+      if (fresh.length) msg += `\nnew: ${fresh.slice(0, 8).join(", ")}${fresh.length > 8 ? "…" : ""}`;
       if (this.unresolvedNotes.length) msg += `\nleftover conflict markers in:\n${this.unresolvedNotes.slice(0, 5).join("\n")}`;
       if (!pairs.length && !initial.length && !done.size) {
         msg += `. Nothing is linked yet: create a realm folder like ${this.s.rootFolder}/metals and sync again ` +
           `(pulls "${this.s.initialPullQuery}"), use "Pull topics by tag…", or add a folder mapping.`;
       }
-      if (!quiet || errors.length || results.conflict || results.unresolved) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
+      if (!quiet || errors.length || results.conflict || results.unresolved || fresh.length) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
     });
   }
 
@@ -634,6 +660,8 @@ export default class DieselSyncPlugin extends Plugin {
       await this.run("pulling…", async () => {
         const wpaths = await this.tagQuery(realm, tags);
         if (!wpaths.length) { new Notice("Diesel: no topics match that tag query"); this.setStatus("idle"); return; }
+        const un = this.data.ignored.filter((w) => !wpaths.includes(w));
+        if (un.length !== this.data.ignored.length) { this.data.ignored = un; await this.save(); } // explicit pull un-ignores
         const results: Record<string, number> = {};
         const errors: string[] = [];
         await this.syncList(wpaths, results, errors);
@@ -659,6 +687,11 @@ export default class DieselSyncPlugin extends Plugin {
       try { const o = await this.syncPair(this.pathFor(w), w); results[o] = (results[o] ?? 0) + 1; }
       catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
     }
+  }
+
+  realmFolders(): string[] {
+    const root = this.app.vault.getAbstractFileByPath(normalizePath(this.s.rootFolder));
+    return root instanceof TFolder ? root.children.filter((c): c is TFolder => c instanceof TFolder).map((c) => c.name) : [];
   }
 
   // realm folders under the root that hold no notes yet -> candidates for the initial pull
@@ -759,6 +792,10 @@ class DieselSettingTab extends PluginSettingTab {
       .setDesc("When Sync all finds an empty realm folder under the root (e.g. Diesel/metals), it pulls this tag query. " +
         "Tags AND together, a leading - excludes, and a category name works as a tag: topic, topic/-hq, story. Empty = off.")
       .addText((t) => t.setValue(s.initialPullQuery).onChange(async (v) => { s.initialPullQuery = v.trim(); await save(); }));
+    new Setting(containerEl).setName("Pull new topics")
+      .setDesc("On every Sync all, also pull topics matching that query that aren't in a realm folder yet (created on the reactor since). " +
+        "Notes you delete locally aren't re-pulled; Pull topics by tag… brings them back.")
+      .addToggle((t) => t.setValue(s.pullNewTopics).onChange(async (v) => { s.pullNewTopics = v; await save(); }));
 
     new Setting(containerEl).setName("Sync only local edits")
       .setDesc("Avoid multi-obsidian sync issues: with Obsidian Sync on several devices, only notes typed in on this device are " +

@@ -40,6 +40,7 @@ export class Vault {
   async create(p: string, c: string) { this.files.set(p, c); const parts = p.split("/"); for (let i = 1; i < parts.length; i++) this.folders.add(parts.slice(0, i).join("/")); return this.getAbstractFileByPath(p) as TFile; }
   async createFolder(p: string) { this.folders.add(p); }
   async trash(f: TFile) { this.files.delete(f.path); }
+  async delete(f: TFile) { this.files.delete(f.path); await this.handlers.delete?.(f); }
   getMarkdownFiles() { return [...this.files.keys()].filter(p => p.endsWith(".md")).map(p => this.getAbstractFileByPath(p) as TFile); }
   on(ev: string, fn: any) { this.handlers[ev] = fn; return {}; }
 }

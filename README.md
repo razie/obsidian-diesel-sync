@@ -6,6 +6,7 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
 
 - A note's body is the topic's content, byte for byte. The plugin adds no frontmatter; the note-to-topic link, last-synced version and content hash live in the plugin's data file.
 - On sync, each side is compared against the last sync: a local-only change is pushed, a remote-only change is pulled.
+- **Pull new topics** (setting, on by default): every Sync all re-runs the pull query for each realm folder and pulls matching topics that aren't in the vault yet, i.e. ones created on the reactor after the initial pull. A synced note you delete locally goes on an ignore list so it isn't pulled straight back (the topic on the reactor is never deleted); **Pull topics by tag…** fetches it again and takes it off the list.
 - **Sync only local edits** (setting, off by default): avoid multi-obsidian sync issues. With Obsidian Sync on several devices, each running Diesel Sync, only notes typed in on *this* device are pushed or merged; a change that arrived from another device is left to that device (reported as "elsewhere"). Remote-only changes still pull everywhere. Edits made outside Obsidian (other editors, scripts) don't count as typed — use **Push current note** for those.
 - A change on both sides is three-way merged against the last-synced text (kept in `.obsidian/plugins/diesel-sync/base/`). Non-overlapping edits merge cleanly and the result is pushed. Overlapping hunks are marked in the note, and the reactor copy is saved next to it as `<name>.diesel-conflict.md`:
 
