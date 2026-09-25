@@ -29,6 +29,18 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
   `RazInvest/Cards | metals.CompanyCard | Card- | card`
 - Base URL pattern `https://{realm}.dieselapps.com`, with per-realm overrides.
 
+## d2 projects (aiheroapps.com)
+
+Since 0.4.0 the plugin also syncs d2 projects, which have their own API. List them under **d2 projects**, one per line; `d2spec` is there by default:
+
+    d2spec
+    myproject = d2t_…     # optional: an AI token made on that project's Tokens page
+
+- Without a token, your **User** and **Password** are used (d2 accepts them like a log-in). A token is safer: it's limited to one project and a level, and you can revoke it without changing your password.
+- Their notes live under the root like realms, `Diesel/d2spec/Topic/Diesel2.md`. Sync all makes the folder and pulls the project's Topics the first time (the **Initial pull query**, `topic` by default).
+- d2's shared topics (Help and the AI skill, which every project shows from the base) aren't synced into a project.
+- The **Base URL pattern** is for d1 reactors only; d2 projects use the **d2 URL pattern** (`https://{realm}.aiheroapps.com`). A d1 pattern pointed at aiheroapps.com is put back to dieselapps.com on load.
+
 ## Commands
 
 Sync all (also on the ribbon), sync current note, push current note (create or link to a wpath), pull topic by wpath, pull by tag (`realm/tag1/tag2`), open current note on the reactor, and the two conflict resolvers. Optional auto-sync every N minutes.
@@ -49,6 +61,9 @@ npm run build     # typecheck + production build
 npm run test:merge  # offline merge unit tests
 DIESEL_AUTH=<base64 user:pass> npm run test:live   # end-to-end against metals, scratch topics tagged claude,test, cleaned up after
 ```
+
+d2: `D2_TOKEN=<token> npm run test:d2` runs the live checks against a d2 project (default the `d2pro` demo, which resets on every d2 deploy; `D2_PROJECT=` for another).
+
 
 ## Release
 

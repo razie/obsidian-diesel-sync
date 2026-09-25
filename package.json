@@ -9,7 +9,8 @@
     "test:live": "esbuild test/live.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/live.js --log-level=warning && node test/.out/live.js",
     "test:initial": "esbuild test/initial.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/initial.js --log-level=warning && node test/.out/initial.js",
     "version": "node version-bump.mjs && git add manifest.json versions.json",
-    "test:merge": "esbuild test/merge.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/merge.js --log-level=warning && node test/.out/merge.js"
+    "test:merge": "esbuild test/merge.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/merge.js --log-level=warning && node test/.out/merge.js",
+    "test:d2": "esbuild test/d2.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/d2.js --log-level=warning && node test/.out/d2.js"
   },
   "keywords": [
     "obsidian",

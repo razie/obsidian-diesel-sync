@@ -19,6 +19,8 @@ interface Settings {
   password: string;
   baseUrlPattern: string;   // {realm} is replaced, e.g. https://{realm}.dieselapps.com
   baseUrlOverrides: string; // lines: realm = https://host
+  d2Projects: string;       // d2 (aiheroapps.com) projects, one per line: project [= AI token]; the rest are d1 realms
+  d2UrlPattern: string;     // {realm} is replaced by the project, e.g. https://{realm}.aiheroapps.com
   rootFolder: string;       // generic layout: <root>/<realm>/<Category>/<name>.md
   defaultRealm: string;
   mappings: string;         // lines: folder | realm.Category | prefix | tag1,tag2
@@ -59,6 +61,8 @@ const DEFAULTS: Settings = {
   password: "",
   baseUrlPattern: "https://{realm}.dieselapps.com",
   baseUrlOverrides: "",
+  d2Projects: "d2spec",
+  d2UrlPattern: "https://{realm}.aiheroapps.com",
   rootFolder: "Diesel",
   defaultRealm: "metals",
   mappings: "",
@@ -123,6 +127,8 @@ export default class DieselSyncPlugin extends Plugin {
       state: raw?.state ?? {},
       ignored: raw?.ignored ?? [],
     };
+    // 0.4.0: d2 has its own URL setting; a d1 pattern pointed at aiheroapps.com would send d1 realms (metals) there
+    if (/aiheroapps\.com/.test(this.data.settings.baseUrlPattern)) { this.data.settings.baseUrlPattern = DEFAULTS.baseUrlPattern; await this.saveData(this.data); }
 
     this.statusEl = this.addStatusBarItem();
     this.setStatus("idle");
@@ -154,7 +160,7 @@ export default class DieselSyncPlugin extends Plugin {
         const w = this.wpathFor(f);
         if (!w) { new Notice("Diesel: this note isn't linked to a topic"); return; }
         const p = parseWpath(w)!;
-        window.open(`${this.baseUrl(p.realm)}/wiki/${w}`);
+        window.open(this.d2(p.realm) ? `${this.baseUrl(p.realm)}/topics/${this.d2Id(p)}` : `${this.baseUrl(p.realm)}/wiki/${w}`);
       }),
     });
 
@@ -216,11 +222,22 @@ export default class DieselSyncPlugin extends Plugin {
 
   // ---------- config ----------
 
+  // d2 projects (0.4.0): listed in "d2 projects"; they use d2's API (/api/v2/topics) at the d2 URL pattern
+  d2(realm: string): { token?: string } | undefined {
+    for (const line of (this.s.d2Projects ?? "").split("\n")) {
+      const m = line.match(/^\s*([a-z0-9-]+)\s*(?:=\s*(\S+))?\s*$/); if (m && m[1] === realm) return { token: m[2] };
+    }
+    return undefined;
+  }
+  // a d2 topic's id: the name for a Topic, else Category:name
+  d2Id(p: { category: string; name: string }): string { return p.category === "Topic" ? p.name : `${p.category}:${p.name}`; }
+
   baseUrl(realm: string): string {
     for (const line of this.s.baseUrlOverrides.split("\n")) {
       const m = line.match(/^\s*([^=\s]+)\s*=\s*(\S+)\s*$/);
       if (m && m[1] === realm) return m[2].replace(/\/+$/, "");
     }
+    if (this.d2(realm)) return (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace("{realm}", realm).replace(/\/+$/, "");
     return this.s.baseUrlPattern.replace("{realm}", realm).replace(/\/+$/, "");
   }
 
@@ -280,16 +297,27 @@ export default class DieselSyncPlugin extends Plugin {
 
   // ---------- HTTP ----------
 
-  auth(): Record<string, string> {
+  auth(realm?: string): Record<string, string> {
+    const tok = realm ? this.d2(realm)?.token : undefined;
+    if (tok) return { Authorization: "Bearer " + tok };            // a d2 project's AI token wins
     if (!this.s.user) throw new Error("set your reactor user + password in the plugin settings");
-    return { Authorization: "Basic " + btoa(`${this.s.user}:${this.s.password}`) };
+    const b = new TextEncoder().encode(`${this.s.user}:${this.s.password}`); let bin = ""; for (const x of b) bin += String.fromCharCode(x);
+    return { Authorization: "Basic " + btoa(bin) };                // d1, and d2 without a token
   }
 
   async getRemote(wpath: string): Promise<Remote | null> {
     const p = parseWpath(wpath)!;
+    if (this.d2(p.realm)) {
+      const r = await requestUrl({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false });
+      if (r.status === 404) return null;
+      if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
+      const d = r.json;
+      if (d.project && d.project !== p.realm) throw new Error(`${wpath} is ${d.project}'s shared topic, not this project's — not syncing it`);
+      return { realm: p.realm, category: p.category, name: p.name, content: d.text ?? "", ver: Number(d.ver) || 0, tags: [] };
+    }
     const r = await requestUrl({
       url: `${this.baseUrl(p.realm)}/api/v1/wiki/json/${wpath}`,
-      headers: this.auth(), throw: false,
+      headers: this.auth(p.realm), throw: false,
     });
     if (r.status === 404) return null;
     if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status} (401 can also mean "no such topic")`);
@@ -303,6 +331,12 @@ export default class DieselSyncPlugin extends Plugin {
 
   async write(kind: "create" | "update", wpath: string, content: string): Promise<void> {
     const p = parseWpath(wpath)!;
+    if (this.d2(p.realm)) {   // d2: one PUT creates or updates; the body is the markdown
+      const r = await requestUrl({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`, method: "PUT",
+        headers: this.auth(p.realm), contentType: "text/markdown", body: content, throw: false });
+      if (r.status === 200 || r.status === 201) { if (r.json?.draft) throw new Error(`${wpath}: saved as a draft (the token writes drafts); publish it in d2`); return; }
+      throw new Error(`${kind} ${wpath}: HTTP ${r.status} ${r.text.slice(0, 160)}`);
+    }
     const we: Record<string, unknown> = { category: p.category, name: p.name, realm: p.realm, content };
     if (kind === "create") {
       Object.assign(we, {
@@ -313,7 +347,7 @@ export default class DieselSyncPlugin extends Plugin {
     const r = await requestUrl({
       url: `${this.baseUrl(p.realm)}/api/v1/wiki/${kind}/${wpath}`,
       method: "POST",
-      headers: this.auth(),
+      headers: this.auth(p.realm),
       contentType: "application/x-www-form-urlencoded",
       body: "we=" + encodeURIComponent(JSON.stringify(we)),
       throw: false,
@@ -564,6 +598,13 @@ export default class DieselSyncPlugin extends Plugin {
       const errors: string[] = [];
       const initial: string[] = [];
       const done = new Set<string>();
+      // each listed d2 project gets its folder under the root, so an empty one is pulled below (0.4.0)
+      for (const line of (this.s.d2Projects ?? "").split("\n")) {
+        const m = line.match(/^\s*([a-z0-9-]+)/); if (!m) continue;
+        const root = normalizePath(this.s.rootFolder), f = normalizePath(`${root}/${m[1]}`);
+        if (!this.app.vault.getAbstractFileByPath(root)) { try { await this.app.vault.createFolder(root); } catch { /* exists */ } }
+        if (!this.app.vault.getAbstractFileByPath(f)) { try { await this.app.vault.createFolder(f); } catch { /* exists */ } }
+      }
       const q = this.s.initialPullQuery.split("/").map((x) => x.trim()).filter(Boolean);
       if (q.length) {
         for (const realm of this.emptyRealmFolders()) {
@@ -672,9 +713,19 @@ export default class DieselSyncPlugin extends Plugin {
 
   // tags AND together; a leading "-" excludes (e.g. ["topic", "-hq"]); a category name works as a tag
   async tagQuery(realm: string, tags: string[]): Promise<string[]> {
+    if (this.d2(realm)) {   // d2: list the project's topics; a category name picks that category, other tags match the topic's tags
+      const r = await requestUrl({ url: `${this.baseUrl(realm)}/api/v2/topics`, headers: this.auth(realm), throw: false });
+      if (r.status !== 200) throw new Error(`list ${realm}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
+      const list: { name: string; category: string; tags?: string[] }[] = r.json?.data ?? [];
+      const cats = new Set(list.map(t => t.category.toLowerCase()));
+      const want = tags.filter(t => !t.startsWith("-")), not = tags.filter(t => t.startsWith("-")).map(t => t.slice(1).toLowerCase());
+      return list.filter(t => want.every(w => cats.has(w.toLowerCase()) || w.toLowerCase() === "topic" ? t.category.toLowerCase() === w.toLowerCase() : (t.tags ?? []).map(x => x.toLowerCase()).includes(w.toLowerCase()))
+          && !not.some(x => (t.tags ?? []).map(y => y.toLowerCase()).includes(x) || t.category.toLowerCase() === x))
+        .map(t => { const i = t.name.indexOf(":"); return i > 0 && t.category !== "Topic" ? `${realm}.${t.category}:${t.name.slice(i + 1)}` : `${realm}.Topic:${t.name}`; });
+    }
     const r = await requestUrl({
       url: `${this.baseUrl(realm)}/api/v1/wiki/tag/${tags.map(encodeURIComponent).join("/")}`,
-      headers: this.auth(), throw: false,
+      headers: this.auth(realm), throw: false,
     });
     if (r.status === 404) return [];
     if (r.status !== 200) throw new Error(`tag query ${realm}/${tags.join("/")}: HTTP ${r.status}`);
@@ -777,6 +828,13 @@ class DieselSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(s.baseUrlPattern).onChange(async (v) => { s.baseUrlPattern = v.trim(); await save(); }));
     new Setting(containerEl).setName("Base URL overrides").setDesc("One per line: realm = https://host")
       .addTextArea((t) => t.setValue(s.baseUrlOverrides).onChange(async (v) => { s.baseUrlOverrides = v; await save(); }));
+    containerEl.createEl("h3", { text: "d2 (aiheroapps.com)" });
+    new Setting(containerEl).setName("d2 projects")
+      .setDesc("One per line: a d2 project, optionally = an AI token made on that project's Tokens page (e.g. d2spec = d2t_…). " +
+        "Without a token, your user and password above are used. Folders for them live under the root like realms: Diesel/d2spec.")
+      .addTextArea((t) => { t.inputEl.rows = 3; t.setValue(s.d2Projects).onChange(async (v) => { s.d2Projects = v; await save(); }); });
+    new Setting(containerEl).setName("d2 URL pattern").setDesc("{realm} is replaced by the project.")
+      .addText((t) => t.setValue(s.d2UrlPattern).onChange(async (v) => { s.d2UrlPattern = v.trim(); await save(); }));
     new Setting(containerEl).setName("Default realm")
       .addText((t) => t.setValue(s.defaultRealm).onChange(async (v) => { s.defaultRealm = v.trim(); await save(); }));
 
