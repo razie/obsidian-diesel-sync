@@ -29,5 +29,12 @@ const note = (i: number) => `Diesel/metals/Topic/n${i}.md`, w = (i: number) => `
   check("5 setting off: kept", vault.files.has(note(9)));
   p.data.settings.deleteRemoved = true; await p.syncAll();
   check("6 a few at once: deleted", !vault.files.has(note(9)));
+  // 7 (0.6.1): a d2 project that refuses the login is called once per sync, not once per note
+  p.data.settings.d2Projects = "d2x"; let calls = 0;
+  for (let i = 0; i < 6; i++) { vault.files.set(`Diesel/d2x/Topic/x${i}.md`, "# x\n"); p.data.state[`Diesel/d2x/Topic/x${i}.md`] = { wpath: `d2x.Topic:x${i}`, ver: 1, hash: "h", at: 0 }; }
+  const real = (p as any).getRemote;
+  (p as any).getRemote = async (w: string) => { if (w.startsWith("d2x.")) { calls++; throw new Error(`read ${w}: HTTP 401 (log in)`); } return real(w); };
+  await p.syncAll();
+  check("7 a realm refusing the login is skipped after the first 401", calls === 1, `calls=${calls}`);
   console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);
 })();

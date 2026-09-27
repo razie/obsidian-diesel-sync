@@ -714,7 +714,7 @@ export default class DieselSyncPlugin extends Plugin {
 
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
-      this.unresolvedNotes = [];
+      this.unresolvedNotes = []; this.refused.clear();
       const results: Record<string, number> = {};
       const errors: string[] = [];
       const initial: string[] = [];
@@ -735,7 +735,7 @@ export default class DieselSyncPlugin extends Plugin {
             this.setStatus(`initial pull ${realm} (${wpaths.length})…`);
             await this.syncList(wpaths, results, errors);
             wpaths.forEach((w) => done.add(w));
-          } catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
+          } catch (e) { this.noteRefusal(`${realm}.`, e); results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
         }
       }
       const pairs: [string, string][] = [];
@@ -757,13 +757,14 @@ export default class DieselSyncPlugin extends Plugin {
             await this.syncList(news, results, errors);
             news.forEach((w) => seen.add(w));
             if ((results.pulled ?? 0) > before) fresh.push(...news.map((w) => w.split(":").pop()!));
-          } catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
+          } catch (e) { this.noteRefusal(`${realm}.`, e); results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
         }
       }
       this.gone = []; this.keptNotes = [];
       for (const [path, w] of pairs) {
+        if (this.refused.has(w.split(".")[0])) { results.skipped = (results.skipped ?? 0) + 1; continue; }
         try { const o = await this.syncPair(path, w); if (o !== "gone") results[o] = (results[o] ?? 0) + 1; }
-        catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
+        catch (e) { this.noteRefusal(w, e); results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
       }
       await this.applyDeletes(pairs, results, errors);
       let msg = this.summarize(results, errors);
@@ -862,9 +863,17 @@ export default class DieselSyncPlugin extends Plugin {
 
   async syncList(wpaths: string[], results: Record<string, number>, errors: string[]) {
     for (const w of wpaths) {
+      if (this.refused.has(w.split(".")[0])) { results.skipped = (results.skipped ?? 0) + 1; continue; }
       try { const o = await this.syncPair(this.pathFor(w), w); results[o] = (results[o] ?? 0) + 1; }
-      catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
+      catch (e) { this.noteRefusal(w, e); results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
     }
+  }
+  // A realm that refuses the login (401) is left alone for the rest of the sync (0.6.1): with a stale password, calling
+  // it for every note just runs into the reactor's lockout and keeps it locked.
+  refused = new Set<string>();
+  noteRefusal(wpath: string, e: unknown) {
+    const realm = wpath.split(".")[0];   // d2 only: on d1 a 401 can also mean "no such topic"
+    if (this.d2(realm) && /HTTP 401\b/.test((e as Error)?.message ?? "")) { if (!this.refused.has(realm)) { this.refused.add(realm); clientLog.add("error", `${realm} refused the login: skipping it for the rest of this sync (check the user/password or the project's token)`); } }
   }
 
   realmFolders(): string[] {

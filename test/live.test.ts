@@ -12,7 +12,7 @@ const A = "metals.Topic:ClaudeTestSyncA", Bw = "metals.Topic:ClaudeTestSyncB";
 const PA = "Scratch/CT-ClaudeTestSyncA.md";
 (async () => {
   await p.onload();
-  Object.assign(p.data.settings, { user, password, mappings: "Scratch | metals.Topic | CT- | claude,test" });
+  Object.assign(p.data.settings, { d2Projects: "", user, password, mappings: "Scratch | metals.Topic | CT- | claude,test" });
   try {
     vault.files.set(PA, "# Sync A\n\nline one\n");
     await p.syncAll(); let r = await p.getRemote(A);

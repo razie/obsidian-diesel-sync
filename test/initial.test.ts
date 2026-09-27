@@ -9,7 +9,7 @@ let pass = 0, fail = 0;
 const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; console.log(`${ok ? "PASS" : "FAIL"} ${n} ${x}`); };
 (async () => {
   await p.onload();
-  Object.assign(p.data.settings, { user, password, initialPullQuery: "topic/-hq" });
+  Object.assign(p.data.settings, { d2Projects: "", user, password, initialPullQuery: "topic/-hq" });
   await p.syncAll();
   check("0 no root folder -> nothing pulled", vault.files.size === 0);
   vault.folders.add("Diesel"); vault.folders.add("Diesel/metals");
