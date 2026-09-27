@@ -43,5 +43,15 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   check("8 a topic deleted in d2 takes its note to the trash", !vault.files.has(PA) && !p.data.state[PA] && !p.data.ignored.includes(`${PROJ}.Topic:t-obsidian`));
   check("9 an edited note of a deleted topic is kept", vault.files.get(PB) === "# B\n\nedited here\n" && !!p.data.state[PB]);
   vault.files.delete(PB); delete p.data.state[PB];
+  // 10-11 (0.6.0): the plugin's log goes to d2's detailed log, with d2's request ids and no secrets
+  const { clientLog } = await import("../src/main");
+  check("10a reactor calls are logged with d2's request id", clientLog.lines.some((l: any) => /GET .*aiheroapps\.com\/api\/v2\/topics/.test(l.msg) && /^[0-9a-f]{12}$/.test(l.rid ?? "")));
+  const marker = `upload-marker-${Date.now()}`; clientLog.add("warn", `${marker} Bearer ${TOKEN}`);
+  Object.assign(p.data.settings, { logProject: PROJ, deviceName: "test-runner" });
+  const sent = await p.uploadLog();
+  const got = (await (await fetch(`https://${PROJ}.aiheroapps.com/api/v2/logs?kind=client&tests=1&text=${marker}`, { headers: { Authorization: "Bearer " + TOKEN } })).json() as any).data;
+  check("10 the log is uploaded to d2's detailed log", /log lines sent/.test(sent) && got.length === 1 && got[0].device === "test-runner" && got[0].source === "obsidian-diesel-sync", sent);
+  check("11 no token in it", !JSON.stringify(got).includes(TOKEN!) && got[0].msg.includes("Bearer ***"));
+  check("11b only new lines next time", await p.uploadLog() === "nothing new in the log");
   console.log(`\n${pass} passed, ${fail} failed`);
 })();

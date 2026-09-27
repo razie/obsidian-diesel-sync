@@ -1,12 +1,14 @@
 (globalThis as any).window = globalThis;
 export const log: string[] = [];
-export class Notice { constructor(m: string) { log.push(m); console.log("  [notice]", m.replace(/\n/g," | ")); } }
+export const Platform = { isMobile: false, isIosApp: false, isTablet: false };
+export class Notice { constructor(m: string, _t?: number) { log.push(m); console.log("  [notice]", m.replace(/\n/g," | ")); } }
 export function normalizePath(p: string) { return p.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/"); }
 export async function requestUrl(o: any) {
   const headers: any = { ...(o.headers || {}) }; if (o.contentType) headers["Content-Type"] = o.contentType;
   const r = await fetch(o.url, { method: o.method || "GET", headers, body: o.body });
   const text = await r.text();
-  return { status: r.status, text, get json() { return JSON.parse(text); } };
+  const h: Record<string, string> = {}; r.headers.forEach((v, k) => { h[k] = v; });
+  return { status: r.status, text, headers: h, get json() { return JSON.parse(text); } };
 }
 export class TAbstractFile { constructor(public path: string) {} get name() { return this.path.split("/").pop()!; } parent: any = null; }
 export class TFolder extends TAbstractFile { children: TAbstractFile[] = []; }

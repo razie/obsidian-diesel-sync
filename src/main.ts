@@ -1,8 +1,29 @@
 import {
-  App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder,
-  normalizePath, requestUrl,
+  App, Modal, Notice as ObsidianNotice, Plugin, PluginSettingTab, Setting, TFile, TFolder,
+  normalizePath, requestUrl, Platform,
 } from "obsidian";
 import { diff3Merge, diffComm } from "node-diff3";
+
+// ---------- the plugin's own log (0.6.0) ----------
+// A rolling log of what the plugin did: every notice, every reactor call (method, path, status, time, and d2's
+// X-Request-Id, which ties it to the server's own log), sync outcomes and errors. Kept in the plugin folder
+// (log.json) and uploaded to d2's detailed log on request, or by itself when a sync hits errors.
+export type LogLine = { at: string; level: "error" | "warn" | "info" | "debug"; msg: string; rid?: string };
+const LOG_KEEP = 800;
+// never let a secret into the log: auth headers, tokens, passwords in URLs
+export const scrub = (m: string) => m.replace(/\b(Basic|Bearer)\s+[A-Za-z0-9+/=._~-]{8,}/g, "$1 ***").replace(/\/\/[^/@\s:]+:[^/@\s]+@/g, "//***@");
+export class ClientLog {
+  lines: LogLine[] = []; uploaded = 0;   // lines[0..uploaded) were sent already
+  add(level: LogLine["level"], msg: string, rid?: string) {
+    this.lines.push({ at: new Date().toISOString(), level, msg: scrub(msg).slice(0, 2000), ...(rid ? { rid } : {}) });
+    if (this.lines.length > LOG_KEEP) { const cut = this.lines.length - LOG_KEEP; this.lines.splice(0, cut); this.uploaded = Math.max(0, this.uploaded - cut); }
+  }
+}
+export const clientLog = new ClientLog();
+// every notice also goes to the log
+class Notice extends ObsidianNotice {
+  constructor(m: string, t?: number) { super(m, t); clientLog.add(/error|failed|refus|HTTP [45]\d\d/i.test(m) ? "warn" : "info", m); }
+}
 
 // ---------- types ----------
 
@@ -34,6 +55,9 @@ interface Settings {
   inlineConflicts: boolean; // merge conflicts into the note with markers (else: conflict copy only)
   markerOpen: string;       // e.g. vvvvvvv
   markerClose: string;      // e.g. ^^^^^^^
+  logProject: string;       // the d2 project the log is uploaded to (0.6.0)
+  logOnErrors: boolean;     // upload the log by itself when a sync ends with errors
+  deviceName: string;       // how this device is named in the uploaded log (blank: iPad / phone / desktop)
 }
 
 interface SyncState {
@@ -77,6 +101,9 @@ const DEFAULTS: Settings = {
   inlineConflicts: true,
   markerOpen: "vvvvvvv",
   markerClose: "^^^^^^^",
+  logProject: "d2spec",
+  logOnErrors: true,
+  deviceName: "",
 };
 
 const CONFLICT_SUFFIX = ".diesel-conflict.md";
@@ -139,7 +166,11 @@ export default class DieselSyncPlugin extends Plugin {
 
     this.addRibbonIcon("refresh-cw", "Diesel: sync all", () => this.syncAll());
 
+    await this.loadLog();
     this.addCommand({ id: "sync-all", name: "Sync all mapped notes", callback: () => this.syncAll() });
+    this.addCommand({ id: "upload-log", name: "Upload log to d2", callback: async () => {
+      try { new ObsidianNotice(`Diesel: ${await this.uploadLog(true)}`); } catch (e) { new ObsidianNotice(`Diesel: ${(e as Error).message}`, 10000); }
+    } });
     this.addCommand({
       id: "sync-current", name: "Sync current note",
       checkCallback: (check) => this.withActive(check, (f) => this.syncOneReport(f)),
@@ -310,17 +341,52 @@ export default class DieselSyncPlugin extends Plugin {
     return { Authorization: "Basic " + btoa(bin) };                // d1, and d2 without a token
   }
 
+  // every reactor call goes through here: logged with its time, status and d2's request id (0.6.0)
+  async http(o: { url: string; method?: string; headers?: Record<string, string>; body?: string; contentType?: string; throw?: boolean }) {
+    const t0 = Date.now(), method = o.method ?? "GET", where = o.url.replace(/^https?:\/\//, "").split("?")[0];
+    try {
+      const r = await requestUrl(o);
+      const rid = (r.headers ?? {})["x-request-id"] ?? (r.headers ?? {})["X-Request-Id"];
+      clientLog.add(r.status >= 500 ? "error" : r.status >= 400 && r.status !== 404 ? "warn" : "debug", `${method} ${where} ${r.status} ${Date.now() - t0}ms`, rid);
+      return r;
+    } catch (e) { clientLog.add("error", `${method} ${where} failed after ${Date.now() - t0}ms: ${(e as Error).message}`); throw e; }
+  }
+
+  logFile(): string { return normalizePath(`${this.manifest?.dir ?? ".obsidian/plugins/diesel-sync"}/log.json`); }
+  async saveLog() { try { await this.app.vault.adapter.write(this.logFile(), JSON.stringify({ uploaded: clientLog.uploaded, lines: clientLog.lines })); } catch { /* the log never breaks a sync */ } }
+  async loadLog() {
+    try { const j = JSON.parse(await this.app.vault.adapter.read(this.logFile())); clientLog.lines = j.lines ?? []; clientLog.uploaded = j.uploaded ?? clientLog.lines.length; } catch { /* none yet */ }
+  }
+  device(): string { return this.s.deviceName.trim() || (Platform?.isIosApp && Platform?.isTablet ? "iPad" : Platform?.isMobile ? "phone" : "desktop"); }
+  // send the lines not sent yet (all of them with `all`) to d2's detailed log
+  async uploadLog(all = false): Promise<string> {
+    const proj = this.s.logProject.trim(); if (!proj) throw new Error("set the log project in the settings");
+    const from = all ? 0 : clientLog.uploaded, lines = clientLog.lines.slice(from);
+    if (!lines.length) return "nothing new in the log";
+    const r = await requestUrl({ url: `${this.d2(proj) ? this.baseUrl(proj) : (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace("{realm}", proj)}/api/v2/logs/client`, method: "POST", headers: this.auth(proj), contentType: "application/json",
+      body: JSON.stringify({ source: "obsidian-diesel-sync", version: this.manifest?.version ?? "?", device: this.device(), lines }), throw: false });
+    if (r.status !== 200) throw new Error(`log upload to ${proj}: HTTP ${r.status}${r.status === 404 ? " (that d2 is too old for log uploads)" : ""}`);
+    clientLog.uploaded = clientLog.lines.length; await this.saveLog();
+    return `${lines.length} log lines sent to ${proj}`;
+  }
+  lastAutoUpload = 0;
+  async autoUpload() {
+    if (!this.s.logOnErrors || !this.s.logProject.trim() || Date.now() - this.lastAutoUpload < 10 * 60_000) return;
+    this.lastAutoUpload = Date.now();
+    try { clientLog.add("info", "sync had errors: uploading the log"); await this.uploadLog(); } catch (e) { clientLog.add("warn", `log upload failed: ${(e as Error).message}`); }
+  }
+
   async getRemote(wpath: string): Promise<Remote | null> {
     const p = parseWpath(wpath)!;
     if (this.d2(p.realm)) {
-      const r = await requestUrl({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false });
+      const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false });
       if (r.status === 404) return null;
       if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
       const d = r.json;
       if (d.project && d.project !== p.realm) throw new Error(`${wpath} is ${d.project}'s shared topic, not this project's — not syncing it`);
       return { realm: p.realm, category: p.category, name: p.name, content: d.text ?? "", ver: Number(d.ver) || 0, tags: [] };
     }
-    const r = await requestUrl({
+    const r = await this.http({
       url: `${this.baseUrl(p.realm)}/api/v1/wiki/json/${wpath}`,
       headers: this.auth(p.realm), throw: false,
     });
@@ -337,7 +403,7 @@ export default class DieselSyncPlugin extends Plugin {
   async write(kind: "create" | "update", wpath: string, content: string): Promise<void> {
     const p = parseWpath(wpath)!;
     if (this.d2(p.realm)) {   // d2: one PUT creates or updates; the body is the markdown
-      const r = await requestUrl({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`, method: "PUT",
+      const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`, method: "PUT",
         headers: this.auth(p.realm), contentType: "text/markdown", body: content, throw: false });
       if (r.status === 200 || r.status === 201) { if (r.json?.draft) throw new Error(`${wpath}: saved as a draft (the token writes drafts); publish it in d2`); return; }
       throw new Error(`${kind} ${wpath}: HTTP ${r.status} ${r.text.slice(0, 160)}`);
@@ -349,7 +415,7 @@ export default class DieselSyncPlugin extends Plugin {
         props: { visibility: this.s.visibility, wvis: this.s.wvis },
       });
     }
-    const r = await requestUrl({
+    const r = await this.http({
       url: `${this.baseUrl(p.realm)}/api/v1/wiki/${kind}/${wpath}`,
       method: "POST",
       headers: this.auth(p.realm),
@@ -635,7 +701,7 @@ export default class DieselSyncPlugin extends Plugin {
     if (this.busy) { new Notice("Diesel: a sync is already running"); return; }
     this.busy = true; this.setStatus(label);
     try { return await fn(); }
-    catch (e) { new Notice(`Diesel: ${(e as Error).message}`, 10000); this.setStatus("error"); }
+    catch (e) { clientLog.add("error", `${label} ${(e as Error).stack ?? (e as Error).message}`); new Notice(`Diesel: ${(e as Error).message}`, 10000); this.setStatus("error"); await this.saveLog(); await this.autoUpload(); }
     finally { this.busy = false; }
   }
 
@@ -709,7 +775,10 @@ export default class DieselSyncPlugin extends Plugin {
         msg += `. Nothing is linked yet: create a realm folder like ${this.s.rootFolder}/metals and sync again ` +
           `(pulls "${this.s.initialPullQuery}"), use "Pull topics by tag…", or add a folder mapping.`;
       }
+      clientLog.add(errors.length ? "error" : "info", `sync all: ${msg}`);
       if (!quiet || errors.length || results.conflict || results.unresolved || fresh.length || results.deleted || results.kept) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
+      await this.saveLog();
+      if (errors.length) await this.autoUpload();
     });
   }
 
@@ -772,7 +841,7 @@ export default class DieselSyncPlugin extends Plugin {
   // tags AND together; a leading "-" excludes (e.g. ["topic", "-hq"]); a category name works as a tag
   async tagQuery(realm: string, tags: string[]): Promise<string[]> {
     if (this.d2(realm)) {   // d2: list the project's topics; a category name picks that category, other tags match the topic's tags
-      const r = await requestUrl({ url: `${this.baseUrl(realm)}/api/v2/topics`, headers: this.auth(realm), throw: false });
+      const r = await this.http({ url: `${this.baseUrl(realm)}/api/v2/topics`, headers: this.auth(realm), throw: false });
       if (r.status !== 200) throw new Error(`list ${realm}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
       const list: { name: string; category: string; tags?: string[] }[] = r.json?.data ?? [];
       const cats = new Set(list.map(t => t.category.toLowerCase()));
@@ -781,7 +850,7 @@ export default class DieselSyncPlugin extends Plugin {
           && !not.some(x => (t.tags ?? []).map(y => y.toLowerCase()).includes(x) || t.category.toLowerCase() === x))
         .map(t => { const i = t.name.indexOf(":"); return i > 0 && t.category !== "Topic" ? `${realm}.${t.category}:${t.name.slice(i + 1)}` : `${realm}.Topic:${t.name}`; });
     }
-    const r = await requestUrl({
+    const r = await this.http({
       url: `${this.baseUrl(realm)}/api/v1/wiki/tag/${tags.map(encodeURIComponent).join("/")}`,
       headers: this.auth(realm), throw: false,
     });
@@ -922,6 +991,17 @@ class DieselSettingTab extends PluginSettingTab {
       .setDesc("When a synced topic is deleted on the reactor (d1 or d2), its note goes to the vault's trash (.trash), unless you edited " +
         "it since the last sync: then it's kept and reported. Sync all won't delete most of a realm's notes at once. Off: notes are kept.")
       .addToggle((t) => t.setValue(s.deleteRemoved).onChange(async (v) => { s.deleteRemoved = v; await save(); }));
+
+    containerEl.createEl("h3", { text: "Log" });
+    new Setting(containerEl).setName("Log project")
+      .setDesc("The d2 project the plugin's log goes to (its detailed log, for debugging): the command \"Upload log to d2\", and on errors if on below. " +
+        "Uses this project's token, else your user and password. Passwords and tokens are never in the log.")
+      .addText((t) => t.setValue(s.logProject).onChange(async (v) => { s.logProject = v.trim(); await save(); }));
+    new Setting(containerEl).setName("Upload the log when a sync has errors")
+      .setDesc("At most once every 10 minutes; only the lines not sent yet.")
+      .addToggle((t) => t.setValue(s.logOnErrors).onChange(async (v) => { s.logOnErrors = v; await save(); }));
+    new Setting(containerEl).setName("Device name").setDesc("How this device shows in the log (blank: iPad, phone or desktop).")
+      .addText((t) => t.setValue(s.deviceName).onChange(async (v) => { s.deviceName = v.trim(); await save(); }));
 
     containerEl.createEl("h3", { text: "Conflicts" });
     new Setting(containerEl).setName("Merge conflicts into the note")

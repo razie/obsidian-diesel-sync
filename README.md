@@ -74,3 +74,12 @@ git push && git push --tags
 ```
 
 The tag triggers `.github/workflows/release.yml`, which builds and attaches `main.js` + `manifest.json` to a GitHub release.
+
+## Log (0.6.0)
+
+The plugin keeps its own rolling log (the last 800 lines, in its folder as `log.json`): every notice, every reactor call with its status and time (and, on d2, the request id that ties it to the server's own log), sync outcomes and errors. Passwords and tokens never go in it.
+
+- **Upload log to d2** (command) sends it to the **Log project** (setting, `d2spec` by default) — into d2's detailed log, `kind=client`, tagged with the plugin version and the device.
+- **Upload the log when a sync has errors** (setting, on): at most every 10 minutes, only the lines not sent yet.
+- **Device name** (setting): how this device shows up; blank means iPad, phone or desktop.
+
