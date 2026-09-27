@@ -19,7 +19,8 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
   ```
 
   The markers are markdown-inert (git's `=======` / `>>>>>>>` would render as a heading and a blockquote) and configurable. A note that still has markers is never pushed; once you've edited them out, the next sync pushes the resolution, or re-merges if the topic moved again meanwhile. Without a base (e.g. a note first paired with an existing, different topic) every difference is marked. **Keep local (force push)** and **Take reactor copy (force pull)** still work as escape hatches; force push refuses while markers remain. Turn inline merging off in settings to get the old conflict-copy-only behaviour.
-- Nothing is ever deleted on either side. Deleting a note only unlinks it.
+- Nothing is ever deleted on the reactor. Deleting a note only unlinks it.
+- **Delete notes whose topic was deleted** (setting, on by default, 0.5.0): when a synced topic is deleted on d1 or d2, its note goes to the vault's trash (`.trash`, recoverable). A note edited since the last sync is kept and listed instead; delete it yourself, or **Force push** to recreate the topic. Sync all won't delete more than 3 notes of one realm at once when they're also over a quarter of its linked notes (a wrong URL or login answers "not found" for everything): it reports them instead.
 - If the reactor answers a read with a topic from a different realm (realm-inheritance fallback), the plugin refuses to write it.
 
 ## Where notes live

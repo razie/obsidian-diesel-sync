@@ -87,6 +87,11 @@ const PA = "Scratch/CT-ClaudeTestSyncA.md";
     check("20 remote-only change still pulls", o === "pulled" && vault.files.get(PA)!.includes("diesel web edit"), o);
     p.s.syncOnlyLocalEdits = false;
 
+    // --- a topic deleted on d1 (0.5.0) ---
+    const pb2 = p.pathFor(Bw); await p.syncPair(pb2, Bw);
+    await fetch(`https://metals.dieselapps.com/api/v1/wiki/delete/${Bw}`, { method: "POST", headers: { Authorization: "Basic " + AUTH } });
+    o = await p.syncPair(pb2, Bw);
+    check("21 a topic deleted on d1 takes its unedited note to the trash", o === "deleted" && !vault.files.has(pb2) && !p.data.state[pb2], o);
     const st = p.data.state[PA]; await vault.handlers.rename({ path: "Scratch/CT-Renamed.md" }, PA);
     check("10 rename keeps link", p.data.state["Scratch/CT-Renamed.md"]?.wpath === A && !p.data.state[PA]);
   } finally {

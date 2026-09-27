@@ -15,22 +15,24 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   vault.folders.add("Diesel"); vault.folders.add("Diesel/metals");
   await p.syncAll();
   const pulled = [...vault.files.keys()].filter(k => k.startsWith("Diesel/metals/Topic/"));
-  check("1 empty realm folder -> initial pull of topic/-hq", pulled.length >= 51, `pulled=${pulled.length}`);
+  check("1 empty realm folder -> initial pull of topic/-hq", pulled.length >= 20, `pulled=${pulled.length}`);
   check("2 excluded hq topics not pulled", !pulled.some(k => /HQ-/.test(k)));
-  check("3 content is byte-identical", vault.files.get("Diesel/metals/Topic/Diesel2.md")?.startsWith("Specification for diesel2") === true);
+  // the metals topics come and go (the Diesel2 ones moved to d2spec, 2026-09-25): check against whichever were pulled
+  const pick = pulled.sort()[0], pickW = "metals.Topic:" + pick.split("/").pop()!.replace(/\.md$/, "");
+  check("3 content is byte-identical", vault.files.get(pick) === (await p.getRemote(pickW))?.content, pick);
   const n = vault.files.size; await p.syncAll();
   check("4 second sync: no re-pull, all in-sync", vault.files.size === n && Object.keys(p.data.state).length === pulled.length);
   // new topic on the reactor since the initial pull: simulate by dropping one note + its state silently
-  const D2 = "Diesel/metals/Topic/Diesel2Design.md";
+  const D2 = pulled[1], D2N = D2.split("/").pop()!.replace(/\.md$/, "");
   vault.files.delete(D2); delete p.data.state[D2];
   await p.syncAll();
-  check("5 new remote topic pulled into a non-empty realm folder", vault.files.has(D2) && log.some((m) => m.includes("new: Diesel2Design")));
+  check("5 new remote topic pulled into a non-empty realm folder", vault.files.has(D2) && log.some((m) => m.includes(`new: ${D2N}`)));
   // deleted locally -> ignored, not re-pulled
   await vault.delete(vault.getAbstractFileByPath(D2));
   await p.syncAll();
-  check("6 locally deleted note not re-pulled", !vault.files.has(D2) && p.data.ignored.includes("metals.Topic:Diesel2Design"));
+  check("6 locally deleted note not re-pulled", !vault.files.has(D2) && p.data.ignored.includes(`metals.Topic:${D2N}`));
   // explicit tag pull un-ignores (exercise the same filter the command uses)
-  p.data.ignored = p.data.ignored.filter((w: string) => w !== "metals.Topic:Diesel2Design");
+  p.data.ignored = p.data.ignored.filter((w: string) => w !== `metals.Topic:${D2N}`);
   await p.syncAll();
   check("7 un-ignored -> pulled again", vault.files.has(D2));
   console.log(`\n${pass} passed, ${fail} failed`);

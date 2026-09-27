@@ -33,5 +33,15 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   const own = (await (await fetch(`https://${PROJ}.aiheroapps.com/api/v2/topics`, { headers: { Authorization: "Bearer " + TOKEN } })).json() as any).data.map((t: any) => t.name);
   check("7 a shared topic (d2's Help) is refused, not copied into the project", /shared topic/.test(err7) && !own.includes("Help"), err7);
   vault.files.delete(HP); delete p.data.state[HP];
+  // 8-9 (0.5.0): a topic deleted in d2 takes its unedited note along; an edited note is kept
+  const del = (n: string) => fetch(`https://${PROJ}.aiheroapps.com/api/v2/topics/Topic:${n}`, { method: "DELETE", headers: { Authorization: "Bearer " + TOKEN } });
+  const PB = `Diesel/${PROJ}/Topic/t-obsidian-b.md`;
+  vault.files.set(PB, "# B\n"); await p.syncAll();
+  check("8a both notes are linked", !!p.data.state[PA] && !!p.data.state[PB]);
+  vault.files.set(PB, "# B\n\nedited here\n");
+  await del("t-obsidian"); await del("t-obsidian-b"); await p.syncAll();
+  check("8 a topic deleted in d2 takes its note to the trash", !vault.files.has(PA) && !p.data.state[PA] && !p.data.ignored.includes(`${PROJ}.Topic:t-obsidian`));
+  check("9 an edited note of a deleted topic is kept", vault.files.get(PB) === "# B\n\nedited here\n" && !!p.data.state[PB]);
+  vault.files.delete(PB); delete p.data.state[PB];
   console.log(`\n${pass} passed, ${fail} failed`);
 })();

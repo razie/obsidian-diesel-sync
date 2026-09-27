@@ -30,6 +30,7 @@ interface Settings {
   initialPullQuery: string; // tag query pulled into an empty <root>/<realm> folder, e.g. topic or topic/-hq
   pullNewTopics: boolean;      // every sync: pull topics matching the pull query that aren't in the vault yet
   syncOnlyLocalEdits: boolean; // only push/merge notes typed on this device (multi-device Obsidian Sync)
+  deleteRemoved: boolean;   // a topic deleted on d1/d2 takes its unedited note to the vault's trash (0.5.0)
   inlineConflicts: boolean; // merge conflicts into the note with markers (else: conflict copy only)
   markerOpen: string;       // e.g. vvvvvvv
   markerClose: string;      // e.g. ^^^^^^^
@@ -54,7 +55,7 @@ interface Remote {
   content: string; ver: number; tags: string[];
 }
 
-type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "error";
+type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "error";
 
 const DEFAULTS: Settings = {
   user: "",
@@ -72,12 +73,15 @@ const DEFAULTS: Settings = {
   initialPullQuery: "topic",
   pullNewTopics: true,
   syncOnlyLocalEdits: false,
+  deleteRemoved: true,
   inlineConflicts: true,
   markerOpen: "vvvvvvv",
   markerClose: "^^^^^^^",
 };
 
 const CONFLICT_SUFFIX = ".diesel-conflict.md";
+// Sync all won't delete more than this many notes of one realm at once when they are also more than this share of its linked notes
+const MASS_DELETE_MIN = 3, MASS_DELETE_SHARE = 0.25;
 
 // ---------- helpers ----------
 
@@ -177,7 +181,8 @@ export default class DieselSyncPlugin extends Plugin {
       const st = this.data.state[f.path];
       if (st) {
         delete this.data.state[f.path];
-        if (!this.data.ignored.includes(st.wpath)) this.data.ignored.push(st.wpath);
+        // a note removed because its topic was deleted isn't "deleted locally": if the topic comes back, it's pulled again
+        if (!this.removing.has(f.path) && !this.data.ignored.includes(st.wpath)) this.data.ignored.push(st.wpath);
         await this.save();
       }
     }));
@@ -437,6 +442,9 @@ export default class DieselSyncPlugin extends Plugin {
   hasMarkers(text: string): boolean { return this.markerLine(text) > 0; }
 
   unresolvedNotes: string[] = [];
+  keptNotes: string[] = [];                              // deleted on the reactor, edited here: kept
+  gone: { path: string; wpath: string }[] | null = null; // Sync all: removals applied at the end (applyDeletes)
+  removing = new Set<string>();                          // notes being trashed because their topic was deleted
 
   hunk(out: string[], a: string[], b: string[], ver: number) {
     out.push(`${this.s.markerOpen} obsidian`, ...a, this.midMarker(ver), ...b, `${this.s.markerClose} end`);
@@ -479,7 +487,7 @@ export default class DieselSyncPlugin extends Plugin {
         && !(remote && hash(remote.content) === hash(local))) return "elsewhere";
 
     if (remote === null) {
-      if (st) { new Notice(`Diesel: ${wpath} is gone from the reactor — local note kept, nothing deleted`); return "skipped"; }
+      if (st) return await this.remoteDeleted(path, wpath, local, st);
       await this.write("create", wpath, local!);
       const r = await this.confirm(wpath, 0, hash(local!));
       await this.record(path, wpath, r.ver, local!);
@@ -523,6 +531,53 @@ export default class DieselSyncPlugin extends Plugin {
       return "pulled";
     }
     return await this.conflict(path, wpath, local, remote, st);
+  }
+
+  // The topic was synced before and is gone now: deleted on d1/d2 (0.5.0). An unedited note follows it to the vault's
+  // trash; one edited since the last sync is kept (deleting would lose the edits) and reported. During Sync all the
+  // removals wait in `gone` until the end, so a realm answering "not found" for everything (a wrong URL or login, a
+  // renamed project) can't empty its folder: see applyDeletes.
+  async remoteDeleted(path: string, wpath: string, local: string | null, st: SyncState): Promise<Outcome> {
+    if (!this.s.deleteRemoved) { new Notice(`Diesel: ${wpath} is gone from the reactor — local note kept, nothing deleted`); return "skipped"; }
+    if (local === null) { delete this.data.state[path]; await this.save(); return "skipped"; }
+    if (hash(local) !== st.hash) {
+      this.keptNotes.push(path);
+      if (!this.gone) new Notice(`Diesel: ${wpath} was deleted on the reactor, but this note was edited since — kept. Delete it, or Force push to recreate the topic.`, 10000);
+      return "kept";
+    }
+    if (this.gone) { this.gone.push({ path, wpath }); return "gone"; }
+    await this.trashNote(path);
+    return "deleted";
+  }
+
+  async trashNote(path: string) {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    this.removing.add(path);
+    try {
+      if (f instanceof TFile) await this.app.vault.trash(f, false);   // Obsidian's .trash: recoverable, and Obsidian Sync carries it
+      await this.dropConflictCopy(path);
+      delete this.data.state[path]; if (this.dirty.delete(path)) this.saveDirty();
+      await this.save();
+    } finally { this.removing.delete(path); }
+  }
+
+  // the removals Sync all collected, per realm; a realm where most linked notes vanished at once is left alone
+  async applyDeletes(pairs: [string, string][], results: Record<string, number>, errors: string[]) {
+    const gone = this.gone ?? []; this.gone = null;
+    const byRealm = new Map<string, { path: string; wpath: string }[]>();
+    for (const g of gone) { const r = g.wpath.split(".")[0]; byRealm.set(r, [...(byRealm.get(r) ?? []), g]); }
+    for (const [realm, list] of byRealm) {
+      const linked = pairs.filter(([, w]) => w.split(".")[0] === realm).length;
+      if (list.length > MASS_DELETE_MIN && list.length > linked * MASS_DELETE_SHARE) {
+        errors.push(`${realm}: ${list.length} of ${linked} notes look deleted on the reactor — not deleting that many at once (check the URL and login). ` +
+          `If they really are gone, delete them here, or sync them one by one.`);
+        results.kept = (results.kept ?? 0) + list.length; continue;
+      }
+      for (const g of list) {
+        try { await this.trashNote(g.path); results.deleted = (results.deleted ?? 0) + 1; }
+        catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${g.wpath}: ${(e as Error).message}`); }
+      }
+    }
   }
 
   async conflict(path: string, wpath: string, local: string, remote: Remote, st: SyncState | null): Promise<Outcome> {
@@ -639,11 +694,14 @@ export default class DieselSyncPlugin extends Plugin {
           } catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
         }
       }
+      this.gone = []; this.keptNotes = [];
       for (const [path, w] of pairs) {
-        try { const o = await this.syncPair(path, w); results[o] = (results[o] ?? 0) + 1; }
+        try { const o = await this.syncPair(path, w); if (o !== "gone") results[o] = (results[o] ?? 0) + 1; }
         catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
       }
+      await this.applyDeletes(pairs, results, errors);
       let msg = this.summarize(results, errors);
+      if (this.keptNotes.length) msg += `\ndeleted on the reactor but edited here (kept; delete them, or Force push to recreate):\n${this.keptNotes.slice(0, 5).join("\n")}`;
       if (initial.length) msg = `initial pull (${initial.join(", ")}) — ${msg}`;
       if (fresh.length) msg += `\nnew: ${fresh.slice(0, 8).join(", ")}${fresh.length > 8 ? "…" : ""}`;
       if (this.unresolvedNotes.length) msg += `\nleftover conflict markers in:\n${this.unresolvedNotes.slice(0, 5).join("\n")}`;
@@ -651,7 +709,7 @@ export default class DieselSyncPlugin extends Plugin {
         msg += `. Nothing is linked yet: create a realm folder like ${this.s.rootFolder}/metals and sync again ` +
           `(pulls "${this.s.initialPullQuery}"), use "Pull topics by tag…", or add a folder mapping.`;
       }
-      if (!quiet || errors.length || results.conflict || results.unresolved || fresh.length) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
+      if (!quiet || errors.length || results.conflict || results.unresolved || fresh.length || results.deleted || results.kept) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
     });
   }
 
@@ -859,6 +917,11 @@ class DieselSettingTab extends PluginSettingTab {
       .setDesc("Avoid multi-obsidian sync issues: with Obsidian Sync on several devices, only notes typed in on this device are " +
         "pushed or merged; changes arriving from other devices are left to them. Off: every change syncs, as before.")
       .addToggle((t) => t.setValue(s.syncOnlyLocalEdits).onChange(async (v) => { s.syncOnlyLocalEdits = v; await save(); }));
+
+    new Setting(containerEl).setName("Delete notes whose topic was deleted")
+      .setDesc("When a synced topic is deleted on the reactor (d1 or d2), its note goes to the vault's trash (.trash), unless you edited " +
+        "it since the last sync: then it's kept and reported. Sync all won't delete most of a realm's notes at once. Off: notes are kept.")
+      .addToggle((t) => t.setValue(s.deleteRemoved).onChange(async (v) => { s.deleteRemoved = v; await save(); }));
 
     containerEl.createEl("h3", { text: "Conflicts" });
     new Setting(containerEl).setName("Merge conflicts into the note")
