@@ -42,6 +42,7 @@ interface Settings {
   baseUrlOverrides: string; // lines: realm = https://host
   d2Projects: string;       // d2 (aiheroapps.com) projects, one per line: project [= AI token]; the rest are d1 realms
   d2UrlPattern: string;     // {realm} is replaced by the project, e.g. https://{realm}.aiheroapps.com
+  d1Sync: boolean;          // off: only the d2 projects sync; d1 realms and d1-linked notes are left alone (0.7.0)
   rootFolder: string;       // generic layout: <root>/<realm>/<Category>/<name>.md
   defaultRealm: string;
   mappings: string;         // lines: folder | realm.Category | prefix | tag1,tag2
@@ -66,6 +67,7 @@ interface SyncState {
   hash: string;  // content hash at last sync (both sides equal then)
   at: number;
   base?: boolean; // the last-synced text is stored in the base cache (for three-way merges)
+  host?: string;  // the reactor it was last synced with (0.7.0; older links have none)
 }
 
 interface PluginData {
@@ -79,7 +81,7 @@ interface Remote {
   content: string; ver: number; tags: string[];
 }
 
-type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "error";
+type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "d1" | "error";
 
 const DEFAULTS: Settings = {
   user: "",
@@ -88,6 +90,7 @@ const DEFAULTS: Settings = {
   baseUrlOverrides: "",
   d2Projects: "d2spec",
   d2UrlPattern: "https://{realm}.aiheroapps.com",
+  d1Sync: true,
   rootFolder: "Diesel",
   defaultRealm: "metals",
   mappings: "",
@@ -265,6 +268,9 @@ export default class DieselSyncPlugin extends Plugin {
     }
     return undefined;
   }
+  // d1 sync off (0.7.0): a realm that isn't a d2 project is d1's and is left alone
+  d1Off(realm: string): boolean { return !this.s.d1Sync && !this.d2(realm); }
+  hostOf(realm: string): string { return this.baseUrl(realm).replace(/^https?:\/\//, "").split("/")[0]; }
   // a d2 topic's id: the name for a Topic, else Category:name
   d2Id(p: { category: string; name: string }): string { return p.category === "Topic" ? p.name : `${p.category}:${p.name}`; }
 
@@ -378,10 +384,12 @@ export default class DieselSyncPlugin extends Plugin {
 
   async getRemote(wpath: string): Promise<Remote | null> {
     const p = parseWpath(wpath)!;
+    if (this.d1Off(p.realm)) throw new Error(`${p.realm} is a d1 realm and d1 sync is off`);
     if (this.d2(p.realm)) {
       const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false });
       if (r.status === 404) return null;
-      if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
+      if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}` +
+        (r.status === 400 && r.json?.error?.message ? ` — ${r.json.error.message}` : ""));
       const d = r.json;
       if (d.project && d.project !== p.realm) throw new Error(`${wpath} is ${d.project}'s shared topic, not this project's — not syncing it`);
       return { realm: p.realm, category: p.category, name: p.name, content: d.text ?? "", ver: Number(d.ver) || 0, tags: [] };
@@ -402,6 +410,7 @@ export default class DieselSyncPlugin extends Plugin {
 
   async write(kind: "create" | "update", wpath: string, content: string): Promise<void> {
     const p = parseWpath(wpath)!;
+    if (this.d1Off(p.realm)) throw new Error(`${p.realm} is a d1 realm and d1 sync is off`);
     if (this.d2(p.realm)) {   // d2: one PUT creates or updates; the body is the markdown
       const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`, method: "PUT",
         headers: this.auth(p.realm), contentType: "text/markdown", body: content, throw: false });
@@ -466,7 +475,7 @@ export default class DieselSyncPlugin extends Plugin {
     const prev = this.data.state[path];
     let base = !!(prev && prev.wpath === wpath && prev.hash === h && prev.base);
     if (!base) { try { await this.writeBase(wpath, content); base = true; } catch { base = false; } }
-    this.data.state[path] = { wpath, ver, hash: h, at: Date.now(), base };
+    this.data.state[path] = { wpath, ver, hash: h, at: Date.now(), base, host: this.hostOf(wpath.split(".")[0]) };
     await this.save();
     if (this.dirty.has(path)) { // clear only if nothing was typed while we were syncing
       const f = this.app.vault.getAbstractFileByPath(path);
@@ -542,8 +551,20 @@ export default class DieselSyncPlugin extends Plugin {
     const af = this.app.vault.getAbstractFileByPath(path);
     const file = af instanceof TFile ? af : null;
     const local = file ? await this.app.vault.read(file) : null;
-    const remote = await this.getRemote(wpath);
     const st = this.data.state[path];
+    // d1 sync off (0.7.0): d1 realms, and notes last synced with another reactor (d1, before this folder became a d2
+    // project), are left alone. A link older than 0.7.0 has no host: d2 answering decides; a miss never deletes it.
+    let remote: Remote | null | undefined;
+    if (!this.s.d1Sync) {
+      const realm = wpath.split(".")[0];
+      if (!this.d2(realm)) return "d1";
+      if (st?.host && st.host !== this.hostOf(realm)) return "d1";
+      if (st && !st.host) {
+        try { remote = await this.getRemote(wpath); } catch (e) { if (/HTTP 400\b/.test((e as Error).message)) return "d1"; throw e; }
+        if (remote === null) return "d1";
+      }
+    }
+    if (remote === undefined) remote = await this.getRemote(wpath);
 
     if (local === null && remote === null) return "skipped";
 
@@ -706,7 +727,7 @@ export default class DieselSyncPlugin extends Plugin {
   }
 
   summarize(results: Record<string, number>, errors: string[]) {
-    const parts = Object.entries(results).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`);
+    const parts = Object.entries(results).filter(([, n]) => n).map(([k, n]) => `${n} ${k === "d1" ? "d1 (left alone, d1 sync is off)" : k}`);
     const msg = parts.length ? parts.join(", ") : "nothing to sync";
     this.setStatus(`${msg} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
     return msg + (errors.length ? `\n${errors.length} error(s):\n${errors.slice(0, 5).join("\n")}` : "");
@@ -728,7 +749,7 @@ export default class DieselSyncPlugin extends Plugin {
       }
       const q = this.s.initialPullQuery.split("/").map((x) => x.trim()).filter(Boolean);
       if (q.length) {
-        for (const realm of this.emptyRealmFolders()) {
+        for (const realm of this.emptyRealmFolders().filter((r) => !this.d1Off(r))) {
           try {
             const wpaths = await this.tagQuery(realm, q);
             initial.push(`${realm}: ${wpaths.length}`);
@@ -748,7 +769,7 @@ export default class DieselSyncPlugin extends Plugin {
       const fresh: string[] = [];
       if (q.length && this.s.pullNewTopics) {
         const initialRealms = new Set(initial.map((x) => x.split(":")[0]));
-        for (const realm of this.realmFolders().filter((r) => !initialRealms.has(r))) {
+        for (const realm of this.realmFolders().filter((r) => !initialRealms.has(r) && !this.d1Off(r))) {
           try {
             const news = (await this.tagQuery(realm, q)).filter((w) => !seen.has(w) && !this.data.ignored.includes(w));
             if (!news.length) continue;
@@ -789,7 +810,7 @@ export default class DieselSyncPlugin extends Plugin {
       if (!w) { new Notice('Diesel: not linked to a topic — use "Push current note"'); this.setStatus("idle"); return; }
       this.unresolvedNotes = [];
       const o = await this.syncPair(f.path, w);
-      new Notice(`Diesel: ${w} — ${o}` + (o === "unresolved" ? ` — leftover marker at line ${this.markerLine(await this.app.vault.read(f))}` : ""));
+      new Notice(`Diesel: ${w} — ${o === "d1" ? "d1's, left alone (d1 sync is off)" : o}` + (o === "unresolved" ? ` — leftover marker at line ${this.markerLine(await this.app.vault.read(f))}` : ""));
       this.setStatus(`${o} · ${w}`);
     });
   }
@@ -841,6 +862,7 @@ export default class DieselSyncPlugin extends Plugin {
 
   // tags AND together; a leading "-" excludes (e.g. ["topic", "-hq"]); a category name works as a tag
   async tagQuery(realm: string, tags: string[]): Promise<string[]> {
+    if (this.d1Off(realm)) throw new Error(`${realm} is a d1 realm and d1 sync is off`);
     if (this.d2(realm)) {   // d2: list the project's topics; a category name picks that category, other tags match the topic's tags
       const r = await this.http({ url: `${this.baseUrl(realm)}/api/v2/topics`, headers: this.auth(realm), throw: false });
       if (r.status !== 200) throw new Error(`list ${realm}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
@@ -965,6 +987,10 @@ class DieselSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Base URL overrides").setDesc("One per line: realm = https://host")
       .addTextArea((t) => t.setValue(s.baseUrlOverrides).onChange(async (v) => { s.baseUrlOverrides = v; await save(); }));
     containerEl.createEl("h3", { text: "d2 (aiheroapps.com)" });
+    new Setting(containerEl).setName("Sync d1 reactors (dieselapps.com)")
+      .setDesc("Off: only the d2 projects below sync. Notes of d1 realms, and notes last synced with d1 in a folder that is now " +
+        "a d2 project, are left alone: nothing read, written or deleted.")
+      .addToggle((t) => t.setValue(s.d1Sync).onChange(async (v) => { s.d1Sync = v; await save(); }));
     new Setting(containerEl).setName("d2 projects")
       .setDesc("One per line: a d2 project, optionally = an AI token made on that project's Tokens page (e.g. d2spec = d2t_…). " +
         "Without a token, your user and password above are used. Folders for them live under the root like realms: Diesel/d2spec.")
