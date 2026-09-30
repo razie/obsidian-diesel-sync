@@ -86,3 +86,5 @@ The plugin keeps its own rolling log (the last 800 lines, in its folder as `log.
 ## d1 sync off (0.7.0)
 
 **Sync d1 reactors (dieselapps.com)** (setting, on): turn it off to sync only the **d2 projects**. Nothing of a d1 realm is read, written, queried or deleted — its notes just stay. A folder that moved from d1 to d2 (e.g. `metals`) keeps its old d1 notes safe: a note records the reactor it was last synced with; a link older than 0.7.0 is adopted if d2 has the topic and otherwise left alone (a d1 category d2 doesn't have, or a topic d2 doesn't have, is never deleted or recreated). The sync notice counts them as "d1 (left alone)". Test: `npm run test:d1off` (offline).
+
+The base project `d2` lives on the bare domain: its URL is `https://aiheroapps.com`, not `d2.aiheroapps.com` (0.7.1), so its links open where you're logged in.

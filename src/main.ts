@@ -279,7 +279,10 @@ export default class DieselSyncPlugin extends Plugin {
       const m = line.match(/^\s*([^=\s]+)\s*=\s*(\S+)\s*$/);
       if (m && m[1] === realm) return m[2].replace(/\/+$/, "");
     }
-    if (this.d2(realm)) return (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace("{realm}", realm).replace(/\/+$/, "");
+    if (this.d2(realm)) {   // base d2 lives on the bare domain: d2.aiheroapps.com -> aiheroapps.com (0.7.1)
+      const u = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/\/+$/, "");
+      return realm === "d2" ? u.replace(/\{realm\}\./, "") : u.replace("{realm}", realm);
+    }
     return this.s.baseUrlPattern.replace("{realm}", realm).replace(/\/+$/, "");
   }
 
@@ -558,7 +561,8 @@ export default class DieselSyncPlugin extends Plugin {
     if (!this.s.d1Sync) {
       const realm = wpath.split(".")[0];
       if (!this.d2(realm)) return "d1";
-      if (st?.host && st.host !== this.hostOf(realm)) return "d1";
+      const d2Domain = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/^https?:\/\//, "").split("/")[0].replace(/^\{realm\}\./, "");
+      if (st?.host && !(st.host === d2Domain || st.host.endsWith("." + d2Domain))) return "d1";   // last synced with d1
       if (st && !st.host) {
         try { remote = await this.getRemote(wpath); } catch (e) { if (/HTTP 400\b/.test((e as Error).message)) return "d1"; throw e; }
         if (remote === null) return "d1";

@@ -43,5 +43,13 @@ const st = (path: string, wpath: string, text: string, host?: string) => {
   // 8 d1 on again: the d1 realm syncs as before
   p.data.settings.d1Sync = true; asked.length = 0; await p.syncAll();
   check("8 d1 on: d1 realm read again", asked.includes("other.Topic:X"));
+  // 9 (0.7.1): base d2 is the bare domain
+  p.data.settings.d2Projects = "d2\nd2spec";
+  check("9 d2 -> aiheroapps.com, others keep their host", p.baseUrl("d2") === "https://aiheroapps.com" && p.baseUrl("d2spec") === "https://d2spec.aiheroapps.com", p.baseUrl("d2"));
+  // 10: a d2 note recorded under the old d2.aiheroapps.com host still syncs
+  Object.assign(p.data.settings, { d1Sync: false });
+  vault.files.set("Diesel/d2/Topic/Z.md", "# z\n"); p.data.state["Diesel/d2/Topic/Z.md"] = { wpath: "d2.Topic:Z", ver: 1, hash: "x", at: 0, host: "d2.aiheroapps.com" } as any;
+  remote.set("d2.Topic:Z", "# z\n"); asked.length = 0; await p.syncAll();
+  check("10 old d2.aiheroapps host: synced, host moved to aiheroapps.com", asked.includes("d2.Topic:Z") && p.data.state["Diesel/d2/Topic/Z.md"].host === "aiheroapps.com");
   console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);
 })();
