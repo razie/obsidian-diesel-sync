@@ -30,7 +30,7 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
   `RazInvest/Cards | metals.CompanyCard | Card- | card`
 - Base URL pattern `https://{realm}.dieselapps.com`, with per-realm overrides.
 
-## d2 projects (aiheroapps.com)
+## d2 projects (ai-putty.com)
 
 Since 0.4.0 the plugin also syncs d2 projects, which have their own API. List them under **d2 projects**, one per line; `d2spec` is there by default:
 
@@ -40,7 +40,8 @@ Since 0.4.0 the plugin also syncs d2 projects, which have their own API. List th
 - Without a token, your **User** and **Password** are used (d2 accepts them like a log-in). A token is safer: it's limited to one project and a level, and you can revoke it without changing your password.
 - Their notes live under the root like realms, `Diesel/d2spec/Topic/Diesel2.md`. Sync all makes the folder and pulls the project's Topics the first time (the **Initial pull query**, `topic` by default).
 - d2's shared topics (Help and the AI skill, which every project shows from the base) aren't synced into a project.
-- The **Base URL pattern** is for d1 reactors only; d2 projects use the **d2 URL pattern** (`https://{realm}.aiheroapps.com`). A d1 pattern pointed at aiheroapps.com is put back to dieselapps.com on load.
+- The **Base URL pattern** is for d1 reactors only; d2 projects use the **d2 URL pattern** (`https://{realm}.ai-putty.com`). A d1 pattern pointed at a d2 domain is put back to dieselapps.com on load.
+- d2 moved to ai-putty.com (0.8.0): on load, a d2 URL pattern, overrides and synced-note hosts still on aiheroapps.com, aiputty.com or aidieselapps.com are moved to ai-putty.com (the old domains only redirect).
 
 ## Commands
 
@@ -87,4 +88,4 @@ The plugin keeps its own rolling log (the last 800 lines, in its folder as `log.
 
 **Sync d1 reactors (dieselapps.com)** (setting, on): turn it off to sync only the **d2 projects**. Nothing of a d1 realm is read, written, queried or deleted — its notes just stay. A folder that moved from d1 to d2 (e.g. `metals`) keeps its old d1 notes safe: a note records the reactor it was last synced with; a link older than 0.7.0 is adopted if d2 has the topic and otherwise left alone (a d1 category d2 doesn't have, or a topic d2 doesn't have, is never deleted or recreated). The sync notice counts them as "d1 (left alone)". Test: `npm run test:d1off` (offline).
 
-The base project `d2` lives on the bare domain: its URL is `https://aiheroapps.com`, not `d2.aiheroapps.com` (0.7.1), so its links open where you're logged in.
+The base project `d2` lives on the bare domain: its URL is `https://ai-putty.com`, not `d2.ai-putty.com` (0.7.1), so its links open where you're logged in.

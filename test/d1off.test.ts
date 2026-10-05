@@ -33,7 +33,7 @@ const st = (path: string, wpath: string, text: string, host?: string) => {
   check("1 d1-only realm: never called", !asked.some(w => w.startsWith("other.")) && vault.files.has("Diesel/other/Topic/X.md"));
   check("2 d1 category in a d2 folder (400): left alone", vault.files.has("RazInvest/Cards/Card-A.md") && !written.includes("metals.CompanyCard:A"));
   check("3 old link missing on d2: not deleted, not recreated", vault.files.has("Diesel/metals/Topic/Old.md") && !written.includes("metals.Topic:Old"));
-  check("4 old link found on d2: adopted (host recorded)", p.data.state["Diesel/metals/Topic/Same.md"]?.host === "metals.aiheroapps.com");
+  check("4 old link found on d2: adopted (host recorded)", p.data.state["Diesel/metals/Topic/Same.md"]?.host === "metals.ai-putty.com");
   check("5 a new note in the d2 folder is created", written.includes("metals.Topic:New"));
   check("6 no tag query for d1 realms", !queried.includes("other") && !queried.includes("empty1"), queried.join(","));
   // 7 a note last synced with d1 (host dieselapps) is left alone even though d2 has the name
@@ -45,11 +45,22 @@ const st = (path: string, wpath: string, text: string, host?: string) => {
   check("8 d1 on: d1 realm read again", asked.includes("other.Topic:X"));
   // 9 (0.7.1): base d2 is the bare domain
   p.data.settings.d2Projects = "d2\nd2spec";
-  check("9 d2 -> aiheroapps.com, others keep their host", p.baseUrl("d2") === "https://aiheroapps.com" && p.baseUrl("d2spec") === "https://d2spec.aiheroapps.com", p.baseUrl("d2"));
+  check("9 d2 -> ai-putty.com, others keep their host", p.baseUrl("d2") === "https://ai-putty.com" && p.baseUrl("d2spec") === "https://d2spec.ai-putty.com", p.baseUrl("d2"));
   // 10: a d2 note recorded under the old d2.aiheroapps.com host still syncs
   Object.assign(p.data.settings, { d1Sync: false });
   vault.files.set("Diesel/d2/Topic/Z.md", "# z\n"); p.data.state["Diesel/d2/Topic/Z.md"] = { wpath: "d2.Topic:Z", ver: 1, hash: "x", at: 0, host: "d2.aiheroapps.com" } as any;
   remote.set("d2.Topic:Z", "# z\n"); asked.length = 0; await p.syncAll();
-  check("10 old d2.aiheroapps host: synced, host moved to aiheroapps.com", asked.includes("d2.Topic:Z") && p.data.state["Diesel/d2/Topic/Z.md"].host === "aiheroapps.com");
+  check("10 old d2.aiheroapps host: synced, host moved to ai-putty.com", asked.includes("d2.Topic:Z") && p.data.state["Diesel/d2/Topic/Z.md"].host === "ai-putty.com");
+  // 11 (0.8.0): settings and links saved on the old d2 domains move to ai-putty.com on load
+  const q = new DieselSyncPlugin(app as any, {} as any);
+  (q as any).loadData = async () => ({ settings: { d2UrlPattern: "https://{realm}.aiheroapps.com", baseUrlPattern: "https://{realm}.aiputty.com",
+    baseUrlOverrides: "metals = https://metals.aiheroapps.com\nfoo = https://foo.dieselapps.com" },
+    state: { "a.md": { wpath: "metals.Topic:A", ver: 1, hash: "x", at: 0, host: "metals.aiheroapps.com" }, "b.md": { wpath: "other.Topic:B", ver: 1, hash: "x", at: 0, host: "other.dieselapps.com" } } });
+  let saved = 0; (q as any).saveData = async () => { saved++; };
+  await q.onload();
+  check("11 old d2 domains migrated on load", q.data.settings.d2UrlPattern === "https://{realm}.ai-putty.com"
+    && q.data.settings.baseUrlPattern === "https://{realm}.dieselapps.com"
+    && q.data.settings.baseUrlOverrides === "metals = https://metals.ai-putty.com\nfoo = https://foo.dieselapps.com"
+    && q.data.state["a.md"].host === "metals.ai-putty.com" && q.data.state["b.md"].host === "other.dieselapps.com" && saved > 0, JSON.stringify(q.data.settings.baseUrlOverrides));
   console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);
 })();

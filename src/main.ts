@@ -40,8 +40,8 @@ interface Settings {
   password: string;
   baseUrlPattern: string;   // {realm} is replaced, e.g. https://{realm}.dieselapps.com
   baseUrlOverrides: string; // lines: realm = https://host
-  d2Projects: string;       // d2 (aiheroapps.com) projects, one per line: project [= AI token]; the rest are d1 realms
-  d2UrlPattern: string;     // {realm} is replaced by the project, e.g. https://{realm}.aiheroapps.com
+  d2Projects: string;       // d2 (ai-putty.com) projects, one per line: project [= AI token]; the rest are d1 realms
+  d2UrlPattern: string;     // {realm} is replaced by the project, e.g. https://{realm}.ai-putty.com
   d1Sync: boolean;          // off: only the d2 projects sync; d1 realms and d1-linked notes are left alone (0.7.0)
   rootFolder: string;       // generic layout: <root>/<realm>/<Category>/<name>.md
   defaultRealm: string;
@@ -89,7 +89,7 @@ const DEFAULTS: Settings = {
   baseUrlPattern: "https://{realm}.dieselapps.com",
   baseUrlOverrides: "",
   d2Projects: "d2spec",
-  d2UrlPattern: "https://{realm}.aiheroapps.com",
+  d2UrlPattern: "https://{realm}.ai-putty.com",
   d1Sync: true,
   rootFolder: "Diesel",
   defaultRealm: "metals",
@@ -148,6 +148,11 @@ function safeFileName(name: string): string {
 
 // ---------- plugin ----------
 
+// d2's domain (0.8.0) and the ones it had before; the old ones redirect to it
+const D2_DOMAIN = "ai-putty.com";
+const D2_OLD = /(?<![\w-])(aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/g;
+const D2_ANY = /(?<![\w-])(ai-putty\.com|aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/;
+
 export default class DieselSyncPlugin extends Plugin {
   data!: PluginData;
   statusEl!: HTMLElement;
@@ -161,8 +166,10 @@ export default class DieselSyncPlugin extends Plugin {
       state: raw?.state ?? {},
       ignored: raw?.ignored ?? [],
     };
-    // 0.4.0: d2 has its own URL setting; a d1 pattern pointed at aiheroapps.com would send d1 realms (metals) there
-    if (/aiheroapps\.com/.test(this.data.settings.baseUrlPattern)) { this.data.settings.baseUrlPattern = DEFAULTS.baseUrlPattern; await this.saveData(this.data); }
+    // 0.4.0: d2 has its own URL setting; a d1 pattern pointed at a d2 domain would send d1 realms (metals) there
+    if (D2_ANY.test(this.data.settings.baseUrlPattern)) { this.data.settings.baseUrlPattern = DEFAULTS.baseUrlPattern; await this.saveData(this.data); }
+    // 0.8.0: d2 moved to ai-putty.com; the old domains only redirect (and drop auth on the way)
+    if (this.migrateD2Domain()) await this.saveData(this.data);
 
     this.statusEl = this.addStatusBarItem();
     this.setStatus("idle");
@@ -274,12 +281,25 @@ export default class DieselSyncPlugin extends Plugin {
   // a d2 topic's id: the name for a Topic, else Category:name
   d2Id(p: { category: string; name: string }): string { return p.category === "Topic" ? p.name : `${p.category}:${p.name}`; }
 
+  // 0.8.0: move the d2 URL pattern, overrides and link hosts from the old d2 domains to ai-putty.com. True if changed.
+  migrateD2Domain(): boolean {
+    const s = this.data.settings, fix = (v: string) => v.replace(D2_OLD, D2_DOMAIN);
+    let changed = false;
+    for (const k of ["d2UrlPattern", "baseUrlOverrides"] as const) {
+      const v = fix(s[k] ?? ""); if (v !== s[k]) { s[k] = v; changed = true; }
+    }
+    for (const st of Object.values(this.data.state)) {
+      if (st?.host) { const h = fix(st.host); if (h !== st.host) { st.host = h; changed = true; } }
+    }
+    return changed;
+  }
+
   baseUrl(realm: string): string {
     for (const line of this.s.baseUrlOverrides.split("\n")) {
       const m = line.match(/^\s*([^=\s]+)\s*=\s*(\S+)\s*$/);
       if (m && m[1] === realm) return m[2].replace(/\/+$/, "");
     }
-    if (this.d2(realm)) {   // base d2 lives on the bare domain: d2.aiheroapps.com -> aiheroapps.com (0.7.1)
+    if (this.d2(realm)) {   // base d2 lives on the bare domain: d2.ai-putty.com -> ai-putty.com (0.7.1)
       const u = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/\/+$/, "");
       return realm === "d2" ? u.replace(/\{realm\}\./, "") : u.replace("{realm}", realm);
     }
@@ -562,7 +582,7 @@ export default class DieselSyncPlugin extends Plugin {
       const realm = wpath.split(".")[0];
       if (!this.d2(realm)) return "d1";
       const d2Domain = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/^https?:\/\//, "").split("/")[0].replace(/^\{realm\}\./, "");
-      if (st?.host && !(st.host === d2Domain || st.host.endsWith("." + d2Domain))) return "d1";   // last synced with d1
+      if (st?.host && !D2_ANY.test(st.host) && !(st.host === d2Domain || st.host.endsWith("." + d2Domain))) return "d1";   // last synced with d1
       if (st && !st.host) {
         try { remote = await this.getRemote(wpath); } catch (e) { if (/HTTP 400\b/.test((e as Error).message)) return "d1"; throw e; }
         if (remote === null) return "d1";
@@ -990,7 +1010,7 @@ class DieselSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(s.baseUrlPattern).onChange(async (v) => { s.baseUrlPattern = v.trim(); await save(); }));
     new Setting(containerEl).setName("Base URL overrides").setDesc("One per line: realm = https://host")
       .addTextArea((t) => t.setValue(s.baseUrlOverrides).onChange(async (v) => { s.baseUrlOverrides = v; await save(); }));
-    containerEl.createEl("h3", { text: "d2 (aiheroapps.com)" });
+    containerEl.createEl("h3", { text: "d2 (ai-putty.com)" });
     new Setting(containerEl).setName("Sync d1 reactors (dieselapps.com)")
       .setDesc("Off: only the d2 projects below sync. Notes of d1 realms, and notes last synced with d1 in a folder that is now " +
         "a d2 project, are left alone: nothing read, written or deleted.")
