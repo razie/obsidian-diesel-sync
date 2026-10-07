@@ -113,6 +113,10 @@ const CONFLICT_SUFFIX = ".diesel-conflict.md";
 // Sync all won't delete more than this many notes of one realm at once when they are also more than this share of its linked notes
 const MASS_DELETE_MIN = 3, MASS_DELETE_SHARE = 0.25;
 
+// a note left out of a sync on purpose (0.8.1): counted as skipped and said once per `why` in the log, never an error, so
+// it doesn't upload the log after every sync
+export class Skip extends Error { constructor(msg: string, public why = msg) { super(msg); } }
+
 // ---------- helpers ----------
 
 // cyrb53: small, fast, sync string hash (no Node crypto -> works on mobile)
@@ -152,6 +156,7 @@ function safeFileName(name: string): string {
 const D2_DOMAIN = "ai-putty.com";
 const D2_OLD = /(?<![\w-])(aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/g;
 const D2_ANY = /(?<![\w-])(ai-putty\.com|aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/;
+const BASE_UNLISTED = "d2 is base d2, not a d1 reactor: list it under d2 projects (with a token) to sync it";
 
 export default class DieselSyncPlugin extends Plugin {
   data!: PluginData;
@@ -277,6 +282,9 @@ export default class DieselSyncPlugin extends Plugin {
   }
   // d1 sync off (0.7.0): a realm that isn't a d2 project is d1's and is left alone
   d1Off(realm: string): boolean { return !this.s.d1Sync && !this.d2(realm); }
+  // base d2 is never a d1 reactor (0.8.1): d2.dieselapps.com has no topics, so a `d2` folder not listed under d2 projects
+  // is left alone instead of asking d1 for every note in it
+  baseUnlisted(realm: string): boolean { return realm === "d2" && !this.d2(realm); }
   hostOf(realm: string): string { return this.baseUrl(realm).replace(/^https?:\/\//, "").split("/")[0]; }
   // a d2 topic's id: the name for a Topic, else Category:name
   d2Id(p: { category: string; name: string }): string { return p.category === "Topic" ? p.name : `${p.category}:${p.name}`; }
@@ -408,13 +416,16 @@ export default class DieselSyncPlugin extends Plugin {
   async getRemote(wpath: string): Promise<Remote | null> {
     const p = parseWpath(wpath)!;
     if (this.d1Off(p.realm)) throw new Error(`${p.realm} is a d1 realm and d1 sync is off`);
+    if (this.baseUnlisted(p.realm)) throw new Skip(BASE_UNLISTED);
     if (this.d2(p.realm)) {
       const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false });
       if (r.status === 404) return null;
+      if (r.status === 400 && /unknown topic category/.test(r.json?.error?.message ?? ""))   // a d1-only category (CompanyCard, Reactor…)
+        throw new Skip(`read ${wpath}: HTTP 400 — '${p.category}' isn't a d2 category: kept local`, `${p.realm}: '${p.category}' isn't a d2 category — its notes stay local`);
       if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}` +
         (r.status === 400 && r.json?.error?.message ? ` — ${r.json.error.message}` : ""));
       const d = r.json;
-      if (d.project && d.project !== p.realm) throw new Error(`${wpath} is ${d.project}'s shared topic, not this project's — not syncing it`);
+      if (d.project && d.project !== p.realm) throw new Skip(`${wpath} is ${d.project}'s shared topic, not this project's — not syncing it`);
       return { realm: p.realm, category: p.category, name: p.name, content: d.text ?? "", ver: Number(d.ver) || 0, tags: [] };
     }
     const r = await this.http({
@@ -434,6 +445,7 @@ export default class DieselSyncPlugin extends Plugin {
   async write(kind: "create" | "update", wpath: string, content: string): Promise<void> {
     const p = parseWpath(wpath)!;
     if (this.d1Off(p.realm)) throw new Error(`${p.realm} is a d1 realm and d1 sync is off`);
+    if (this.baseUnlisted(p.realm)) throw new Skip(BASE_UNLISTED);
     if (this.d2(p.realm)) {   // d2: one PUT creates or updates; the body is the markdown
       const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`, method: "PUT",
         headers: this.auth(p.realm), contentType: "text/markdown", body: content, throw: false });
@@ -584,7 +596,7 @@ export default class DieselSyncPlugin extends Plugin {
       const d2Domain = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/^https?:\/\//, "").split("/")[0].replace(/^\{realm\}\./, "");
       if (st?.host && !D2_ANY.test(st.host) && !(st.host === d2Domain || st.host.endsWith("." + d2Domain))) return "d1";   // last synced with d1
       if (st && !st.host) {
-        try { remote = await this.getRemote(wpath); } catch (e) { if (/HTTP 400\b/.test((e as Error).message)) return "d1"; throw e; }
+        try { remote = await this.getRemote(wpath); } catch (e) { if (e instanceof Skip || /HTTP 400\b/.test((e as Error).message)) return "d1"; throw e; }
         if (remote === null) return "d1";
       }
     }
@@ -759,7 +771,7 @@ export default class DieselSyncPlugin extends Plugin {
 
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
-      this.unresolvedNotes = []; this.refused.clear();
+      this.unresolvedNotes = []; this.refused.clear(); this.skipsSaid.clear();
       const results: Record<string, number> = {};
       const errors: string[] = [];
       const initial: string[] = [];
@@ -773,14 +785,14 @@ export default class DieselSyncPlugin extends Plugin {
       }
       const q = this.s.initialPullQuery.split("/").map((x) => x.trim()).filter(Boolean);
       if (q.length) {
-        for (const realm of this.emptyRealmFolders().filter((r) => !this.d1Off(r))) {
+        for (const realm of this.emptyRealmFolders().filter((r) => !this.d1Off(r) && !this.baseUnlisted(r) && !this.refused.has(r))) {
           try {
             const wpaths = await this.tagQuery(realm, q);
             initial.push(`${realm}: ${wpaths.length}`);
             this.setStatus(`initial pull ${realm} (${wpaths.length})…`);
             await this.syncList(wpaths, results, errors);
             wpaths.forEach((w) => done.add(w));
-          } catch (e) { this.noteRefusal(`${realm}.`, e); results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
+          } catch (e) { this.failed(`${realm}.`, e, results, errors); }
         }
       }
       const pairs: [string, string][] = [];
@@ -793,7 +805,7 @@ export default class DieselSyncPlugin extends Plugin {
       const fresh: string[] = [];
       if (q.length && this.s.pullNewTopics) {
         const initialRealms = new Set(initial.map((x) => x.split(":")[0]));
-        for (const realm of this.realmFolders().filter((r) => !initialRealms.has(r) && !this.d1Off(r))) {
+        for (const realm of this.realmFolders().filter((r) => !initialRealms.has(r) && !this.d1Off(r) && !this.baseUnlisted(r) && !this.refused.has(r))) {
           try {
             const news = (await this.tagQuery(realm, q)).filter((w) => !seen.has(w) && !this.data.ignored.includes(w));
             if (!news.length) continue;
@@ -802,14 +814,14 @@ export default class DieselSyncPlugin extends Plugin {
             await this.syncList(news, results, errors);
             news.forEach((w) => seen.add(w));
             if ((results.pulled ?? 0) > before) fresh.push(...news.map((w) => w.split(":").pop()!));
-          } catch (e) { this.noteRefusal(`${realm}.`, e); results.error = (results.error ?? 0) + 1; errors.push(`${realm}: ${(e as Error).message}`); }
+          } catch (e) { this.failed(`${realm}.`, e, results, errors); }
         }
       }
       this.gone = []; this.keptNotes = [];
       for (const [path, w] of pairs) {
         if (this.refused.has(w.split(".")[0])) { results.skipped = (results.skipped ?? 0) + 1; continue; }
         try { const o = await this.syncPair(path, w); if (o !== "gone") results[o] = (results[o] ?? 0) + 1; }
-        catch (e) { this.noteRefusal(w, e); results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
+        catch (e) { this.failed(w, e, results, errors); }
       }
       await this.applyDeletes(pairs, results, errors);
       let msg = this.summarize(results, errors);
@@ -887,6 +899,7 @@ export default class DieselSyncPlugin extends Plugin {
   // tags AND together; a leading "-" excludes (e.g. ["topic", "-hq"]); a category name works as a tag
   async tagQuery(realm: string, tags: string[]): Promise<string[]> {
     if (this.d1Off(realm)) throw new Error(`${realm} is a d1 realm and d1 sync is off`);
+    if (this.baseUnlisted(realm)) throw new Skip(BASE_UNLISTED);
     if (this.d2(realm)) {   // d2: list the project's topics; a category name picks that category, other tags match the topic's tags
       const r = await this.http({ url: `${this.baseUrl(realm)}/api/v2/topics`, headers: this.auth(realm), throw: false });
       if (r.status !== 200) throw new Error(`list ${realm}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
@@ -911,15 +924,31 @@ export default class DieselSyncPlugin extends Plugin {
     for (const w of wpaths) {
       if (this.refused.has(w.split(".")[0])) { results.skipped = (results.skipped ?? 0) + 1; continue; }
       try { const o = await this.syncPair(this.pathFor(w), w); results[o] = (results[o] ?? 0) + 1; }
-      catch (e) { this.noteRefusal(w, e); results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`); }
+      catch (e) { this.failed(w, e, results, errors); }
     }
   }
   // A realm that refuses the login (401) is left alone for the rest of the sync (0.6.1): with a stale password, calling
   // it for every note just runs into the reactor's lockout and keeps it locked.
+  // A realm answering 5xx (down, or a deploy) is left alone for the rest of the sync too (0.8.1), d1 or d2: one line, not
+  // one error per note.
   refused = new Set<string>();
   noteRefusal(wpath: string, e: unknown) {
-    const realm = wpath.split(".")[0];   // d2 only: on d1 a 401 can also mean "no such topic"
-    if (this.d2(realm) && /HTTP 401\b/.test((e as Error)?.message ?? "")) { if (!this.refused.has(realm)) { this.refused.add(realm); clientLog.add("error", `${realm} refused the login: skipping it for the rest of this sync (check the user/password or the project's token)`); } }
+    const realm = wpath.split(".")[0], msg = (e as Error)?.message ?? "", down = /HTTP (5\d\d)\b/.exec(msg);
+    if (this.refused.has(realm)) return;
+    if (down) { this.refused.add(realm); clientLog.add("error", `${realm} answered HTTP ${down[1]} (down, or being deployed): skipping it for the rest of this sync`); return; }
+    // d2 only: on d1 a 401 can also mean "no such topic"
+    if (this.d2(realm) && /HTTP 401\b/.test(msg)) { this.refused.add(realm); clientLog.add("error", `${realm} refused the login: skipping it for the rest of this sync (check the user/password or the project's token)`); }
+  }
+  // one note's (or realm's) failure in a sync: a Skip is counted as skipped and logged once per reason; anything else is
+  // an error, and may leave its realm alone for the rest of the sync (noteRefusal)
+  skipsSaid = new Set<string>();
+  failed(w: string, e: unknown, results: Record<string, number>, errors: string[]) {
+    if (e instanceof Skip) {
+      results.skipped = (results.skipped ?? 0) + 1;
+      if (!this.skipsSaid.has(e.why)) { this.skipsSaid.add(e.why); clientLog.add("warn", `skipped: ${e.why}`); }
+      return;
+    }
+    this.noteRefusal(w, e); results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`);
   }
 
   realmFolders(): string[] {

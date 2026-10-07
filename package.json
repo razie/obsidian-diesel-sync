@@ -12,7 +12,8 @@
     "test:merge": "esbuild test/merge.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/merge.js --log-level=warning && node test/.out/merge.js",
     "test:d2": "esbuild test/d2.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/d2.js --log-level=warning && node test/.out/d2.js",
     "test:deletes": "esbuild test/deletes.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/deletes.js --log-level=warning && node test/.out/deletes.js",
-    "test:d1off": "esbuild test/d1off.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/d1off.js --log-level=warning && node test/.out/d1off.js"
+    "test:d1off": "esbuild test/d1off.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/d1off.js --log-level=warning && node test/.out/d1off.js",
+    "test:skips": "esbuild test/skips.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/skips.js --log-level=warning && node test/.out/skips.js"
   },
   "keywords": [
     "obsidian",

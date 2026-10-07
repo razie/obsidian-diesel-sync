@@ -89,3 +89,7 @@ The plugin keeps its own rolling log (the last 800 lines, in its folder as `log.
 **Sync d1 reactors (dieselapps.com)** (setting, on): turn it off to sync only the **d2 projects**. Nothing of a d1 realm is read, written, queried or deleted — its notes just stay. A folder that moved from d1 to d2 (e.g. `metals`) keeps its old d1 notes safe: a note records the reactor it was last synced with; a link older than 0.7.0 is adopted if d2 has the topic and otherwise left alone (a d1 category d2 doesn't have, or a topic d2 doesn't have, is never deleted or recreated). The sync notice counts them as "d1 (left alone)". Test: `npm run test:d1off` (offline).
 
 The base project `d2` lives on the bare domain: its URL is `https://ai-putty.com`, not `d2.ai-putty.com` (0.7.1), so its links open where you're logged in.
+
+## Skipped, not errors (0.8.1)
+
+What a sync leaves out on purpose is counted as **skipped** and said once in the log (a warning), never as an error, so it no longer uploads the log after every sync: notes in a d1-only category inside a d2 project (`CompanyCard`, `Reactor`…: d2 answers *unknown topic category*), a d2 project's view of another project's shared topic, and a `d2` folder while `d2` isn't listed under **d2 projects** — base d2 is never a d1 reactor, so `d2.dieselapps.com` is no longer asked for every note in it. A realm answering 5xx (down, or a deploy) is left alone for the rest of that sync with one error line, like a refused login. Test: `npm run test:skips` (offline).
