@@ -1,5 +1,6 @@
 (globalThis as any).window = globalThis;
 export const log: string[] = [];
+export const status = { text: "" };   // the status bar's last text
 export const Platform = { isMobile: false, isIosApp: false, isTablet: false };
 export class Notice { constructor(m: string, _t?: number) { log.push(m); console.log("  [notice]", m.replace(/\n/g," | ")); } }
 export function normalizePath(p: string) { return p.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/"); }
@@ -50,7 +51,7 @@ export class Plugin {
   stored: any = null;
   constructor(public app: any, public manifest: any = {}) {}
   async loadData() { return this.stored; } async saveData(d: any) { this.stored = JSON.parse(JSON.stringify(d)); }
-  addStatusBarItem() { return { setText: (_: string) => {} }; }
+  addStatusBarItem() { return { setText: (t: string) => { status.text = t; } }; }
   addRibbonIcon() {} addCommand() {} addSettingTab() {} registerEvent() {}
   registerInterval(id: any) { return id; }
 }

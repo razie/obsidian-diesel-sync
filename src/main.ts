@@ -74,6 +74,8 @@ interface PluginData {
   settings: Settings;
   state: Record<string, SyncState>; // key: vault path
   ignored: string[]; // wpaths whose synced note was deleted locally: not re-pulled as "new" (Pull by tag still fetches them)
+  repeats: Record<string, number>; // 0.8.2: a quiet sync's failures (wpath|status) -> when last shown; shown again only once cleared, or a day on
+  said: Record<string, number>;    // 0.8.2: once-a-day notices (a realm refusing the login, a d1 realm that is a d2 project) -> when last said
 }
 
 interface Remote {
@@ -156,6 +158,7 @@ function safeFileName(name: string): string {
 const D2_DOMAIN = "ai-putty.com";
 const D2_OLD = /(?<![\w-])(aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/g;
 const D2_ANY = /(?<![\w-])(ai-putty\.com|aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/;
+const DAY = 86_400_000;
 const BASE_UNLISTED = "d2 is base d2, not a d1 reactor: list it under d2 projects (with a token) to sync it";
 
 export default class DieselSyncPlugin extends Plugin {
@@ -170,6 +173,8 @@ export default class DieselSyncPlugin extends Plugin {
       settings: Object.assign({}, DEFAULTS, raw?.settings ?? {}),
       state: raw?.state ?? {},
       ignored: raw?.ignored ?? [],
+      repeats: raw?.repeats ?? {},
+      said: raw?.said ?? {},
     };
     // 0.4.0: d2 has its own URL setting; a d1 pattern pointed at a d2 domain would send d1 realms (metals) there
     if (D2_ANY.test(this.data.settings.baseUrlPattern)) { this.data.settings.baseUrlPattern = DEFAULTS.baseUrlPattern; await this.saveData(this.data); }
@@ -754,24 +759,57 @@ export default class DieselSyncPlugin extends Plugin {
 
   // ---------- commands ----------
 
-  async run<T>(label: string, fn: () => Promise<T>): Promise<T | undefined> {
-    if (this.busy) { new Notice("Diesel: a sync is already running"); return; }
+  async run<T>(label: string, fn: () => Promise<T>, quiet = false): Promise<T | undefined> {
+    if (this.busy) { if (!quiet) new Notice("Diesel: a sync is already running"); return; }
     this.busy = true; this.setStatus(label);
     try { return await fn(); }
-    catch (e) { clientLog.add("error", `${label} ${(e as Error).stack ?? (e as Error).message}`); new Notice(`Diesel: ${(e as Error).message}`, 10000); this.setStatus("error"); await this.saveLog(); await this.autoUpload(); }
+    catch (e) {
+      const m = (e as Error).message, k = `run|${m}`;
+      clientLog.add("error", `${label} ${(e as Error).stack ?? m}`);
+      const isNew = this.fresh([k]).length > 0;
+      if (!quiet || isNew) new Notice(`Diesel: ${m}`, 10000);
+      if (quiet && isNew) { this.data.repeats[k] = this.now(); await this.save(); }
+      this.setStatus("error"); await this.saveLog(); await this.autoUpload();
+    }
     finally { this.busy = false; }
   }
 
-  summarize(results: Record<string, number>, errors: string[]) {
+  // ---------- notices that repeat (0.8.2) ----------
+  // An auto-sync used to pop a 12-second notice on every run while one error stayed. Now a quiet sync notices only what
+  // the previous one didn't have: each failure is keyed realm.note|status (`issues`), shown once, then counted in the
+  // status bar as repeating until that note syncs clean (`clean`), when it is forgotten and may notice again. The keys
+  // live in the plugin's data, so a restart doesn't re-notify; one still repeating a day on is shown again.
+  now = () => Date.now();
+  issues = new Set<string>();
+  clean = new Set<string>();
+  loginRefused = new Set<string>();
+  fresh(keys: string[]): string[] { return keys.filter((k) => !(k in this.data.repeats) || this.now() - this.data.repeats[k] >= DAY); }
+  statusOf(msg: string): string { return /HTTP (\d{3})\b/.exec(msg)?.[1] ?? msg.slice(0, 80); }
+  outcome(w: string, o: Outcome) { if (o === "unresolved") this.issues.add(`${w}|unresolved`); else this.clean.add(w); }
+  // once a day per key: true when it should be said now (and marks it said)
+  daily(key: string): boolean {
+    const at = this.data.said[key]; if (at && this.now() - at < DAY) return false;
+    this.data.said[key] = this.now(); return true;
+  }
+  // a d1 realm that d2 also has as a project (metals on a desktop set up before it moved): d2's health names it
+  async isD2Project(realm: string): Promise<boolean> {
+    try {
+      const u = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/\/+$/, "").replace("{realm}", realm);
+      const r = await this.http({ url: `${u}/api/v2/health`, throw: false });
+      return r.status === 200 && r.json?.project === realm;
+    } catch { return false; }
+  }
+
+  summarize(results: Record<string, number>, errors: string[], tail = "") {
     const parts = Object.entries(results).filter(([, n]) => n).map(([k, n]) => `${n} ${k === "d1" ? "d1 (left alone, d1 sync is off)" : k}`);
     const msg = parts.length ? parts.join(", ") : "nothing to sync";
-    this.setStatus(`${msg} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
+    this.setStatus(`${msg}${tail} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
     return msg + (errors.length ? `\n${errors.length} error(s):\n${errors.slice(0, 5).join("\n")}` : "");
   }
 
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
-      this.unresolvedNotes = []; this.refused.clear(); this.skipsSaid.clear();
+      this.unresolvedNotes = []; this.refused.clear(); this.skipsSaid.clear(); this.issues.clear(); this.clean.clear(); this.loginRefused.clear();
       const results: Record<string, number> = {};
       const errors: string[] = [];
       const initial: string[] = [];
@@ -820,11 +858,18 @@ export default class DieselSyncPlugin extends Plugin {
       this.gone = []; this.keptNotes = [];
       for (const [path, w] of pairs) {
         if (this.refused.has(w.split(".")[0])) { results.skipped = (results.skipped ?? 0) + 1; continue; }
-        try { const o = await this.syncPair(path, w); if (o !== "gone") results[o] = (results[o] ?? 0) + 1; }
+        try { const o = await this.syncPair(path, w); this.outcome(w, o); if (o !== "gone") results[o] = (results[o] ?? 0) + 1; }
         catch (e) { this.failed(w, e, results, errors); }
       }
       await this.applyDeletes(pairs, results, errors);
-      let msg = this.summarize(results, errors);
+      // what this sync found that the last one didn't; the rest repeats, and is forgotten once its note syncs clean
+      const keys = [...this.issues], news = this.fresh(keys), rep = keys.length - news.length, R = this.data.repeats;
+      // gone: a note that synced clean, a thrown error (this sync got this far), a realm-wide one (`realm.`) not seen
+      // again, and after a manual Sync all, which reaches everything, whatever it didn't find
+      for (const k of Object.keys(R)) { const w = k.split("|")[0];
+        if (w === "run" || this.clean.has(w) || !this.issues.has(k) && (!quiet || w.endsWith("."))) delete R[k]; }
+      for (const k of news) R[k] = this.now();
+      let msg = this.summarize(results, errors, quiet && rep ? ` · ${rep} error${rep === 1 ? "" : "s"} (repeating)` : "");
       if (this.keptNotes.length) msg += `\ndeleted on the reactor but edited here (kept; delete them, or Force push to recreate):\n${this.keptNotes.slice(0, 5).join("\n")}`;
       if (initial.length) msg = `initial pull (${initial.join(", ")}) — ${msg}`;
       if (fresh.length) msg += `\nnew: ${fresh.slice(0, 8).join(", ")}${fresh.length > 8 ? "…" : ""}`;
@@ -834,10 +879,20 @@ export default class DieselSyncPlugin extends Plugin {
           `(pulls "${this.s.initialPullQuery}"), use "Pull topics by tag…", or add a folder mapping.`;
       }
       clientLog.add(errors.length ? "error" : "info", `sync all: ${msg}`);
-      if (!quiet || errors.length || results.conflict || results.unresolved || fresh.length || results.deleted || results.kept) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
+      if (!quiet || news.length || results.conflict || fresh.length || results.deleted || results.kept) new Notice(`Diesel: ${msg}`, errors.length || !pairs.length ? 12000 : 5000);
+      // a realm refusing the login: once a day, with the fix, not once a sync
+      for (const realm of this.loginRefused) if (this.daily(`login|${realm}`))
+        new Notice(`Diesel: ${realm} refused the token: make a new one at ${this.baseUrl(realm)}/ai/tokens and put it on its line`, 12000);
+      // a d1 realm d2 also has (asked once a day): say how to move it, never move it — the two copies may differ
+      const d1s = [...new Set(pairs.map(([, w]) => w.split(".")[0]))].filter((r) => !this.d2(r) && !this.d1Off(r) && !this.baseUnlisted(r));
+      for (const realm of d1s) if (this.daily(`d1d2|${realm}`) && await this.isD2Project(realm)) {
+        clientLog.add("warn", `${realm} is synced with d1 (${this.hostOf(realm)}) but is also a d2 project`);
+        new Notice(`Diesel: ${realm} is synced with d1 (${this.hostOf(realm)}), but it is also one of your d2 projects: add \`${realm}\` to *d2 projects* in settings (with its token) to sync it with d2. Nothing is moved: the two copies may differ.`, 12000);
+      }
+      await this.save();
       await this.saveLog();
       if (errors.length) await this.autoUpload();
-    });
+    }, quiet);
   }
 
   async syncOneReport(f: TFile) {
@@ -923,7 +978,7 @@ export default class DieselSyncPlugin extends Plugin {
   async syncList(wpaths: string[], results: Record<string, number>, errors: string[]) {
     for (const w of wpaths) {
       if (this.refused.has(w.split(".")[0])) { results.skipped = (results.skipped ?? 0) + 1; continue; }
-      try { const o = await this.syncPair(this.pathFor(w), w); results[o] = (results[o] ?? 0) + 1; }
+      try { const o = await this.syncPair(this.pathFor(w), w); this.outcome(w, o); results[o] = (results[o] ?? 0) + 1; }
       catch (e) { this.failed(w, e, results, errors); }
     }
   }
@@ -937,7 +992,7 @@ export default class DieselSyncPlugin extends Plugin {
     if (this.refused.has(realm)) return;
     if (down) { this.refused.add(realm); clientLog.add("error", `${realm} answered HTTP ${down[1]} (down, or being deployed): skipping it for the rest of this sync`); return; }
     // d2 only: on d1 a 401 can also mean "no such topic"
-    if (this.d2(realm) && /HTTP 401\b/.test(msg)) { this.refused.add(realm); clientLog.add("error", `${realm} refused the login: skipping it for the rest of this sync (check the user/password or the project's token)`); }
+    if (this.d2(realm) && /HTTP 401\b/.test(msg)) { this.refused.add(realm); this.loginRefused.add(realm); clientLog.add("error", `${realm} refused the login: skipping it for the rest of this sync (check the user/password or the project's token)`); }
   }
   // one note's (or realm's) failure in a sync: a Skip is counted as skipped and logged once per reason; anything else is
   // an error, and may leave its realm alone for the rest of the sync (noteRefusal)
@@ -949,6 +1004,7 @@ export default class DieselSyncPlugin extends Plugin {
       return;
     }
     this.noteRefusal(w, e); results.error = (results.error ?? 0) + 1; errors.push(`${w}: ${(e as Error).message}`);
+    if (!this.loginRefused.has(w.split(".")[0])) this.issues.add(`${w}|${this.statusOf((e as Error)?.message ?? "")}`);   // a refused login is said once a day instead
   }
 
   realmFolders(): string[] {
