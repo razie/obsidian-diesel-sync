@@ -18,15 +18,21 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   check("1 the project's folder is made and its Topics pulled", pulled.length >= 5, `pulled=${pulled.length}`);
   check("2 byte-identical", vault.files.get(`Diesel/${PROJ}/Topic/Welcome.md`)?.length! > 50);
   check("3 only Topics (no Spec:, no shared Help)", !pulled.some(k => /\/(Help|Skill)/.test(k)));
+  // 0.9.0: a local edit goes to d2 as a draft; publishing it there makes the topic
+  const publish = (n: string) => fetch(`https://${PROJ}.ai-putty.com/api/v2/drafts/${n}/publish`, { method: "POST", headers: { Authorization: "Bearer " + TOKEN } });
   const PA = `Diesel/${PROJ}/Topic/t-obsidian.md`;
   vault.files.set(PA, "# From Obsidian\n\nline one\n"); await p.syncAll();
+  let d = await p.getDraft(`${PROJ}.Topic:t-obsidian`);
+  check("4 a new note makes a draft of a new topic in d2", d?.text === "# From Obsidian\n\nline one\n" && !(await p.getRemote(`${PROJ}.Topic:t-obsidian`)), `dver=${d?.dver}`);
+  await publish("t-obsidian"); await p.syncAll();
   let r = await p.getRemote(`${PROJ}.Topic:t-obsidian`);
-  check("4 a new note is created in d2", !!r && r.content === "# From Obsidian\n\nline one\n", `ver=${r?.ver}`);
+  check("4b published, it syncs back in sync", !!r && r.content === "# From Obsidian\n\nline one\n" && !p.data.state[PA]?.dhash, `ver=${r?.ver}`);
   await p.write("update", `${PROJ}.Topic:t-obsidian`, "# From Obsidian\n\nline one\nline two from d2\n"); await p.syncAll();
   check("5 a d2 edit is pulled", vault.files.get(PA)!.includes("line two from d2"));
   vault.files.set(PA, vault.files.get(PA)! + "line three from obsidian\n"); await p.syncAll();
-  r = await p.getRemote(`${PROJ}.Topic:t-obsidian`);
-  check("6 an Obsidian edit is pushed", !!r && r.content.includes("line three from obsidian"));
+  r = await p.getRemote(`${PROJ}.Topic:t-obsidian`); d = await p.getDraft(`${PROJ}.Topic:t-obsidian`);
+  check("6 an Obsidian edit goes as a draft, not onto the topic", !!d?.text.includes("line three from obsidian") && !r!.content.includes("line three from obsidian"));
+  await publish("t-obsidian");
   const HP = `Diesel/${PROJ}/Topic/Help.md`; vault.files.set(HP, "# mine\n");
   await p.syncAll();
   const err7 = await p.getRemote(`${PROJ}.Topic:Help`).then(() => "", (e: Error) => e.message);
@@ -36,7 +42,7 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   // 8-9 (0.5.0): a topic deleted in d2 takes its unedited note along; an edited note is kept
   const del = (n: string) => fetch(`https://${PROJ}.ai-putty.com/api/v2/topics/Topic:${n}`, { method: "DELETE", headers: { Authorization: "Bearer " + TOKEN } });
   const PB = `Diesel/${PROJ}/Topic/t-obsidian-b.md`;
-  vault.files.set(PB, "# B\n"); await p.syncAll();
+  vault.files.set(PB, "# B\n"); await p.syncAll(); await publish("t-obsidian-b"); await p.syncAll();
   check("8a both notes are linked", !!p.data.state[PA] && !!p.data.state[PB]);
   vault.files.set(PB, "# B\n\nedited here\n");
   await del("t-obsidian"); await del("t-obsidian-b"); await p.syncAll();

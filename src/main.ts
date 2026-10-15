@@ -2,7 +2,6 @@ import {
   App, Modal, Notice as ObsidianNotice, Plugin, PluginSettingTab, Setting, TFile, TFolder,
   normalizePath, requestUrl, Platform,
 } from "obsidian";
-import { diff3Merge, diffComm } from "node-diff3";
 
 // ---------- the plugin's own log (0.6.0) ----------
 // A rolling log of what the plugin did: every notice, every reactor call (method, path, status, time, and d2's
@@ -53,9 +52,8 @@ interface Settings {
   pullNewTopics: boolean;      // every sync: pull topics matching the pull query that aren't in the vault yet
   syncOnlyLocalEdits: boolean; // only push/merge notes typed on this device (multi-device Obsidian Sync)
   deleteRemoved: boolean;   // a topic deleted on d1/d2 takes its unedited note to the vault's trash (0.5.0)
-  inlineConflicts: boolean; // merge conflicts into the note with markers (else: conflict copy only)
-  markerOpen: string;       // e.g. vvvvvvv
-  markerClose: string;      // e.g. ^^^^^^^
+  markerOpen: string;       // the markers 0.8 merged into notes (0.9.0: never written; a note still carrying them isn't pushed)
+  markerClose: string;
   logProject: string;       // the d2 project the log is uploaded to (0.6.0)
   logOnErrors: boolean;     // upload the log by itself when a sync ends with errors
   deviceName: string;       // how this device is named in the uploaded log (blank: iPad / phone / desktop)
@@ -66,9 +64,14 @@ interface SyncState {
   ver: number;   // remote version at last sync
   hash: string;  // content hash at last sync (both sides equal then)
   at: number;
-  base?: boolean; // the last-synced text is stored in the base cache (for three-way merges)
   host?: string;  // the reactor it was last synced with (0.7.0; older links have none)
+  // the d2 draft this note last pushed (0.9.0): its version, ETag and text hash. Gone once it is published or discarded.
+  dver?: number;
+  etag?: string;
+  dhash?: string;
 }
+
+interface Draft { text: string; dver: number; etag: string }
 
 interface PluginData {
   settings: Settings;
@@ -83,7 +86,7 @@ interface Remote {
   content: string; ver: number; tags: string[];
 }
 
-type Outcome = "in-sync" | "pushed" | "created" | "pulled" | "merged" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "d1" | "error";
+type Outcome = "in-sync" | "pushed" | "created" | "drafted" | "draft" | "pulled" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "d1" | "error";
 
 const DEFAULTS: Settings = {
   user: "",
@@ -103,7 +106,6 @@ const DEFAULTS: Settings = {
   pullNewTopics: true,
   syncOnlyLocalEdits: false,
   deleteRemoved: true,
-  inlineConflicts: true,
   markerOpen: "vvvvvvv",
   markerClose: "^^^^^^^",
   logProject: "d2spec",
@@ -111,7 +113,8 @@ const DEFAULTS: Settings = {
   deviceName: "",
 };
 
-const CONFLICT_SUFFIX = ".diesel-conflict.md";
+const CONFLICT_SUFFIX = ".diesel-conflict.md";   // 0.8's reactor copies: never written now, still cleaned up
+const LOCAL_SUFFIX = ".local-conflict.md";       // 0.9.0: d2 won, and the local text went here
 // Sync all won't delete more than this many notes of one realm at once when they are also more than this share of its linked notes
 const MASS_DELETE_MIN = 3, MASS_DELETE_SHARE = 0.25;
 
@@ -183,6 +186,8 @@ export default class DieselSyncPlugin extends Plugin {
 
     this.statusEl = this.addStatusBarItem();
     this.setStatus("idle");
+    // 0.9.0: a status reading "draft pending" opens that draft in d2
+    this.statusEl.addEventListener?.("click", () => { if (this.statusLink) window.open(this.statusLink); });
 
     this.addRibbonIcon("refresh-cw", "Diesel: sync all", () => this.syncAll());
 
@@ -202,11 +207,11 @@ export default class DieselSyncPlugin extends Plugin {
     this.addCommand({ id: "pull-topic", name: "Pull topic by wpath…", callback: () => this.pullTopicPrompt() });
     this.addCommand({ id: "pull-tag", name: "Pull topics by tag…", callback: () => this.pullTagPrompt() });
     this.addCommand({
-      id: "force-push", name: "Resolve conflict: keep local (force push)",
-      checkCallback: (check) => this.withActive(check, (f) => this.forcePush(f)),
+      id: "push-draft", name: "Push current note as a draft now",
+      checkCallback: (check) => this.withActive(check, (f) => this.pushDraftNow(f)),
     });
     this.addCommand({
-      id: "force-pull", name: "Resolve conflict: take reactor copy (force pull)",
+      id: "force-pull", name: "Take the reactor copy (force pull, discards local)",
       checkCallback: (check) => this.withActive(check, (f) => this.forcePull(f)),
     });
     this.addCommand({
@@ -267,7 +272,8 @@ export default class DieselSyncPlugin extends Plugin {
     if (m > 0) this.timer = this.registerInterval(window.setInterval(() => this.syncAll(true), m * 60_000));
   }
 
-  setStatus(t: string) { this.statusEl.setText(`Diesel: ${t}`); }
+  statusLink = "";   // where a click on the status bar goes (a pending draft), "" for nowhere
+  setStatus(t: string, link = "") { this.statusEl.setText(`Diesel: ${t}`); this.statusLink = link; }
 
   withActive(check: boolean, fn: (f: TFile) => void): boolean {
     const f = this.app.workspace.getActiveFile();
@@ -338,7 +344,7 @@ export default class DieselSyncPlugin extends Plugin {
   wpathFor(f: TFile): string | null {
     const st = this.data.state[f.path];
     if (st) return st.wpath;
-    if (f.name.endsWith(CONFLICT_SUFFIX)) return null;
+    if (f.name.endsWith(CONFLICT_SUFFIX) || f.name.endsWith(LOCAL_SUFFIX)) return null;
     const dir = f.parent?.path ?? "";
     for (const m of this.mappings()) {
       if (dir === m.folder && f.basename.startsWith(m.prefix)) {
@@ -477,6 +483,37 @@ export default class DieselSyncPlugin extends Plugin {
     throw new Error(`${kind} ${wpath}: HTTP ${r.status} ${r.text.slice(0, 160)}`);
   }
 
+  // ---------- d2 drafts (0.9.0): a local edit goes to d2 as a draft, never onto the topic ----------
+
+  draftApi(p: { realm: string; category: string; name: string }): string {
+    return `${this.baseUrl(p.realm)}/api/v2/drafts/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`;
+  }
+  // where a person sees the draft in d2
+  draftPage(wpath: string): string {
+    const p = parseWpath(wpath)!;
+    return `${this.baseUrl(p.realm)}/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?draft=1`;
+  }
+
+  // this account's draft of the topic, or null when there is none
+  async getDraft(wpath: string): Promise<Draft | null> {
+    const p = parseWpath(wpath)!;
+    const r = await this.http({ url: `${this.draftApi(p)}?format=json`, headers: this.auth(p.realm), throw: false });
+    if (r.status === 404) return null;
+    if (r.status !== 200) throw new Error(`read the draft of ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
+    const dver = Number(r.json?.dver) || 1;
+    return { text: r.json?.text ?? "", dver, etag: `"d${dver}"` };
+  }
+
+  // save the text as the draft; `etag` is the draft's ETag (`"none"` when there is no draft yet)
+  async putDraft(wpath: string, content: string, etag: string): Promise<Draft> {
+    const p = parseWpath(wpath)!;
+    const r = await this.http({ url: this.draftApi(p), method: "PUT", headers: { ...this.auth(p.realm), "If-Match": etag },
+      contentType: "text/markdown", body: content, throw: false });
+    if (r.status !== 200) throw new Error(`save the draft of ${wpath}: HTTP ${r.status} ${r.text.slice(0, 160)}`);
+    const dver = Number(r.json?.dver) || 1;
+    return { text: content, dver, etag: (r.headers ?? {})["etag"] ?? `"d${dver}"` };
+  }
+
   // writes land in the reactor's caches asynchronously: poll until the version moves
   async confirm(wpath: string, prevVer: number, expectHash: string): Promise<Remote> {
     let last: Remote | null = null;
@@ -510,43 +547,20 @@ export default class DieselSyncPlugin extends Plugin {
     return await this.app.vault.create(path, content);
   }
 
-  async record(path: string, wpath: string, ver: number, content: string) {
+  // the topic's version and text as last synced, and the draft this note stands for (none: the note is the topic)
+  async record(path: string, wpath: string, ver: number, content: string, draft?: Draft) {
     const h = hash(content);
-    const prev = this.data.state[path];
-    let base = !!(prev && prev.wpath === wpath && prev.hash === h && prev.base);
-    if (!base) { try { await this.writeBase(wpath, content); base = true; } catch { base = false; } }
-    this.data.state[path] = { wpath, ver, hash: h, at: Date.now(), base, host: this.hostOf(wpath.split(".")[0]) };
+    this.data.state[path] = { wpath, ver, hash: h, at: Date.now(), host: this.hostOf(wpath.split(".")[0]),
+      ...(draft ? { dver: draft.dver, etag: draft.etag, dhash: hash(draft.text) } : {}) };
     await this.save();
     if (this.dirty.has(path)) { // clear only if nothing was typed while we were syncing
-      const f = this.app.vault.getAbstractFileByPath(path);
-      if (f instanceof TFile && hash(await this.app.vault.read(f)) === h) { this.dirty.delete(path); this.saveDirty(); }
+      const f = this.app.vault.getAbstractFileByPath(path), synced = draft ? hash(draft.text) : h;
+      if (f instanceof TFile && hash(await this.app.vault.read(f)) === synced) { this.dirty.delete(path); this.saveDirty(); }
     }
   }
 
-  // ---------- base cache: last-synced text per topic, for three-way merges ----------
-
-  baseDir(): string { return normalizePath(`${this.manifest?.dir ?? ".obsidian/plugins/diesel-sync"}/base`); }
-  basePath(wpath: string): string { return `${this.baseDir()}/${hash(wpath)}.md`; }
-
-  async writeBase(wpath: string, content: string) {
-    const a = this.app.vault.adapter;
-    const dir = this.baseDir();
-    if (!(await a.exists(dir))) await a.mkdir(dir);
-    await a.write(this.basePath(wpath), content);
-  }
-
-  async readBase(wpath: string, expectHash: string): Promise<string | null> {
-    try {
-      const a = this.app.vault.adapter, p = this.basePath(wpath);
-      if (!(await a.exists(p))) return null;
-      const b = await a.read(p);
-      return hash(b) === expectHash ? b : null; // stale base -> treat as missing
-    } catch { return null; }
-  }
-
-  // ---------- merge ----------
-
-  midMarker(ver: number) { return `${this.s.markerClose} vs ${this.s.markerOpen} diesel v${ver}`; }
+  // ---------- leftover markers ----------
+  // 0.8 merged clashes into the note with markers; 0.9.0 never writes them, but a note still carrying them isn't pushed
 
   // 1-based line of the first leftover marker, or 0
   markerLine(text: string): number {
@@ -557,33 +571,10 @@ export default class DieselSyncPlugin extends Plugin {
   hasMarkers(text: string): boolean { return this.markerLine(text) > 0; }
 
   unresolvedNotes: string[] = [];
+  draftNotes: string[] = [];                             // wpaths whose note waits as a draft in d2 (the status bar's link)
   keptNotes: string[] = [];                              // deleted on the reactor, edited here: kept
   gone: { path: string; wpath: string }[] | null = null; // Sync all: removals applied at the end (applyDeletes)
   removing = new Set<string>();                          // notes being trashed because their topic was deleted
-
-  hunk(out: string[], a: string[], b: string[], ver: number) {
-    out.push(`${this.s.markerOpen} obsidian`, ...a, this.midMarker(ver), ...b, `${this.s.markerClose} end`);
-  }
-
-  // three-way with the last-synced base: non-overlapping edits merge cleanly, overlaps get markers
-  merge3(local: string, base: string, remote: string, ver: number): { text: string; conflicts: number } {
-    const out: string[] = []; let conflicts = 0;
-    for (const blk of diff3Merge(lines(local), lines(base), lines(remote), { excludeFalseConflicts: true })) {
-      if (blk.ok) out.push(...blk.ok);
-      else if (blk.conflict) { conflicts++; this.hunk(out, blk.conflict.a, blk.conflict.b, ver); }
-    }
-    return { text: out.join("\n") + "\n", conflicts };
-  }
-
-  // no base: every difference is a hunk (can't tell an add on one side from a delete on the other)
-  merge2(local: string, remote: string, ver: number): { text: string; conflicts: number } {
-    const out: string[] = []; let conflicts = 0;
-    for (const blk of diffComm(lines(local), lines(remote))) {
-      if (blk.common) out.push(...blk.common);
-      else if (blk.buffer1.length || blk.buffer2.length) { conflicts++; this.hunk(out, blk.buffer1, blk.buffer2, ver); }
-    }
-    return { text: out.join("\n") + "\n", conflicts };
-  }
 
   // ---------- sync core ----------
 
@@ -610,12 +601,15 @@ export default class DieselSyncPlugin extends Plugin {
     if (local === null && remote === null) return "skipped";
 
     // "sync only local edits": a local change nobody typed here came from another device (Obsidian Sync);
-    // that device pushes it — don't push, merge or conflict on it from here
-    if (local !== null && this.s.syncOnlyLocalEdits && !this.dirty.has(path) && (!st || hash(local) !== st.hash)
+    // that device pushes it — don't push, draft or conflict on it from here
+    if (local !== null && this.s.syncOnlyLocalEdits && !this.dirty.has(path) && (!st || (hash(local) !== st.hash && hash(local) !== st.dhash))
         && !(remote && hash(remote.content) === hash(local))) return "elsewhere";
 
+    const isD2 = !!this.d2(wpath.split(".")[0]);
     if (remote === null) {
+      if (st && isD2 && st.ver === 0 && st.dhash) return await this.withDraft(path, wpath, local, null, st);   // a new topic, still a draft
       if (st) return await this.remoteDeleted(path, wpath, local, st);
+      if (isD2) return await this.pushDraft(path, wpath, local!, null);   // a new note: a draft of a new topic
       await this.write("create", wpath, local!);
       const r = await this.confirm(wpath, 0, hash(local!));
       await this.record(path, wpath, r.ver, local!);
@@ -629,36 +623,116 @@ export default class DieselSyncPlugin extends Plugin {
     }
 
     const lh = hash(local), rh = hash(remote.content);
-    if (lh === rh) {
+    if (lh === rh) {   // the note is the topic (its draft, if any, was published)
       await this.record(path, wpath, remote.ver, local);
       await this.dropConflictCopy(path);
       return "in-sync";
     }
 
-    // a note still carrying conflict markers is never pushed
+    // never synced before (a note first paired with an existing, different topic): d2 wins
+    if (!st) return await this.d2Wins(path, wpath, local, remote, `${wpath} already exists ${isD2 ? "in d2" : "on the reactor"}`);
+
+    // its draft was published, and the note was edited further since: the published text is the new base
+    let s0 = st;
+    if (s0.dhash && rh === s0.dhash) { await this.record(path, wpath, remote.ver, remote.content); s0 = this.data.state[path]; }
+
+    // d2 moved (a published version newer than the one last synced)
+    if (remote.ver !== s0.ver && rh !== s0.hash) {
+      if (lh === s0.hash && !s0.dhash) {   // nothing unpushed here, no draft: the note follows d2
+        await this.writeLocal(path, remote.content);
+        await this.record(path, wpath, remote.ver, remote.content);
+        return "pulled";
+      }
+      return await this.d2Wins(path, wpath, local, remote, `${isD2 ? "d2" : "the reactor"} changed ${wpath}`);   // its draft, if any, stays in d2
+    }
+
+    // a note still carrying 0.8's conflict markers is never pushed
     if (this.hasMarkers(local)) {
       this.unresolvedNotes.push(`${path} (line ${this.markerLine(local)})`);
-      return await this.unresolved(path, wpath, remote);
+      return "unresolved";
     }
 
-    if (!st) return await this.conflict(path, wpath, local, remote, null);
+    if (isD2) return await this.withDraft(path, wpath, local, remote, s0);
 
-    const localChanged = lh !== st.hash;
-    const remoteChanged = remote.ver !== st.ver && rh !== st.hash;
-
-    if (localChanged && !remoteChanged) {
-      await this.write("update", wpath, local);
-      const r = await this.confirm(wpath, remote.ver, lh);
-      await this.record(path, wpath, r.ver, local);
-      await this.dropConflictCopy(path);
-      return "pushed";
-    }
-    if (remoteChanged && !localChanged) {
+    // d1 has no drafts: an edit is saved onto the topic, as before
+    if (lh === s0.hash) {   // same version, other text (the reactor normalised it): take it
       await this.writeLocal(path, remote.content);
       await this.record(path, wpath, remote.ver, remote.content);
       return "pulled";
     }
-    return await this.conflict(path, wpath, local, remote, st);
+    await this.write("update", wpath, local);
+    const r = await this.confirm(wpath, remote.ver, lh);
+    await this.record(path, wpath, r.ver, local);
+    await this.dropConflictCopy(path);
+    return "pushed";
+  }
+
+  // d2, the topic didn't move: the note against its draft. Equal: wait for it (draft pending). Gone (discarded in d2):
+  // the note follows the topic. Changed in d2: the note follows the draft. Edited here: the draft is saved again.
+  async withDraft(path: string, wpath: string, local: string | null, remote: Remote | null, st: SyncState): Promise<Outcome> {
+    const lh = local === null ? "" : hash(local);
+    if (!st.dhash && remote && lh === st.hash) {   // same version, other text (d2 normalised it): take it
+      await this.writeLocal(path, remote.content);
+      await this.record(path, wpath, remote.ver, remote.content);
+      return "pulled";
+    }
+    const cur = await this.getDraft(wpath);
+    if (st.dhash) {
+      if (!cur) {   // discarded in d2
+        if (!remote) {   // a new topic's draft: there's no topic to follow; the note goes to the trash, its text beside it
+          if (local !== null) await this.saveAside(path, local, `the draft of ${wpath} (a new topic) was discarded in d2`);
+          await this.trashNote(path);
+          return "conflict";
+        }
+        return await this.d2Wins(path, wpath, local ?? "", remote, `the draft of ${wpath} was discarded in d2`);
+      }
+      if (hash(cur.text) !== st.dhash)   // the draft was changed in d2: the note follows it (a copy only of what wasn't pushed)
+        return lh === st.dhash ? await this.followDraft(path, wpath, remote, cur) : await this.d2Wins(path, wpath, local ?? "", remote, `the draft of ${wpath} was changed in d2`, cur);
+      if (lh === st.dhash) {   // the note is its draft: nothing to push or pull
+        this.draftNotes.push(wpath);
+        if (local !== null) await this.record(path, wpath, remote?.ver ?? 0, remote?.content ?? "", cur);
+        return "draft";
+      }
+    } else if (cur) {   // a draft in d2 this note didn't make (razie's, from the web): it wins
+      if (hash(cur.text) === lh) { await this.record(path, wpath, remote?.ver ?? 0, remote?.content ?? "", cur); this.draftNotes.push(wpath); return "draft"; }
+      return await this.d2Wins(path, wpath, local ?? "", remote, `${wpath} has a draft in d2`, cur);
+    }
+    return await this.pushDraft(path, wpath, local!, remote, cur);
+  }
+
+  async followDraft(path: string, wpath: string, remote: Remote | null, cur: Draft): Promise<Outcome> {
+    await this.writeLocal(path, cur.text);
+    await this.record(path, wpath, remote?.ver ?? 0, remote?.content ?? "", cur);
+    this.draftNotes.push(wpath);
+    return "pulled";
+  }
+
+  // save the note as its topic's draft (over the draft `cur`, if there is one)
+  async pushDraft(path: string, wpath: string, local: string, remote: Remote | null, cur?: Draft | null): Promise<Outcome> {
+    if (cur === undefined) cur = await this.getDraft(wpath);
+    const d = await this.putDraft(wpath, local, cur ? cur.etag : '"none"');
+    await this.record(path, wpath, remote?.ver ?? 0, remote?.content ?? "", d);
+    await this.dropConflictCopy(path);
+    this.draftNotes.push(wpath);
+    return "drafted";
+  }
+
+  // d2 wins (0.9.0): the note takes d2's text (the topic, or the draft `draft`), and the local text, when it differs, is
+  // saved beside it as <name>.local-conflict.md, said once. A draft in d2 stays there to discard or redo.
+  async d2Wins(path: string, wpath: string, local: string, remote: Remote | null, why: string, draft?: Draft): Promise<Outcome> {
+    const text = draft ? draft.text : remote?.content ?? "";
+    const aside = hash(local) !== hash(text);
+    if (aside) await this.saveAside(path, local, why);
+    await this.writeLocal(path, text);
+    await this.record(path, wpath, remote?.ver ?? 0, remote?.content ?? "", draft);
+    if (draft) this.draftNotes.push(wpath);
+    return aside ? "conflict" : "pulled";
+  }
+
+  async saveAside(path: string, local: string, why: string) {
+    const cpath = path.replace(/\.md$/, LOCAL_SUFFIX), cname = cpath.split("/").pop();
+    await this.writeLocal(cpath, local);
+    new Notice(`Diesel: ${why}; your version is in ${cname}`, 12000);
   }
 
   // The topic was synced before and is gone now: deleted on d1/d2 (0.5.0). An unedited note follows it to the vault's
@@ -670,7 +744,7 @@ export default class DieselSyncPlugin extends Plugin {
     if (local === null) { delete this.data.state[path]; await this.save(); return "skipped"; }
     if (hash(local) !== st.hash) {
       this.keptNotes.push(path);
-      if (!this.gone) new Notice(`Diesel: ${wpath} was deleted on the reactor, but this note was edited since — kept. Delete it, or Force push to recreate the topic.`, 10000);
+      if (!this.gone) new Notice(`Diesel: ${wpath} was deleted on the reactor, but this note was edited since — kept. Delete it, or push it to recreate the topic.`, 10000);
       return "kept";
     }
     if (this.gone) { this.gone.push({ path, wpath }); return "gone"; }
@@ -706,55 +780,6 @@ export default class DieselSyncPlugin extends Plugin {
         catch (e) { results.error = (results.error ?? 0) + 1; errors.push(`${g.wpath}: ${(e as Error).message}`); }
       }
     }
-  }
-
-  async conflict(path: string, wpath: string, local: string, remote: Remote, st: SyncState | null): Promise<Outcome> {
-    const cpath = path.replace(/\.md$/, CONFLICT_SUFFIX);
-    const cname = cpath.split("/").pop();
-
-    if (!this.s.inlineConflicts) {
-      await this.writeLocal(cpath, remote.content);
-      new Notice(`Diesel: conflict on ${wpath} — reactor copy saved as ${cname}. ` +
-        `Merge into your note, then run "keep local (force push)".`, 12000);
-      return "conflict";
-    }
-
-    const base = st ? await this.readBase(wpath, st.hash) : null;
-    const m = base !== null ? this.merge3(local, base, remote.content, remote.ver) : this.merge2(local, remote.content, remote.ver);
-
-    if (m.conflicts === 0) {
-      // clean three-way merge: both sides' edits combined
-      await this.writeLocal(path, m.text);
-      if (hash(m.text) === hash(remote.content)) {
-        await this.record(path, wpath, remote.ver, remote.content);
-        return "pulled";
-      }
-      await this.write("update", wpath, m.text);
-      const r = await this.confirm(wpath, remote.ver, hash(m.text));
-      await this.record(path, wpath, r.ver, m.text);
-      await this.dropConflictCopy(path);
-      return "merged";
-    }
-
-    // overlapping edits: markers in the note, reactor copy alongside. The reactor version becomes the
-    // base, so once the markers are gone the next sync pushes the resolution (or re-merges if it moved).
-    await this.writeLocal(cpath, remote.content);
-    await this.writeLocal(path, m.text);
-    await this.record(path, wpath, remote.ver, remote.content);
-    new Notice(`Diesel: conflict on ${wpath} — ${m.conflicts} hunk(s) marked in the note` +
-      (base === null ? " (no merge base: every difference is marked)" : "") +
-      `; reactor copy saved as ${cname}. Resolve the ${this.s.markerOpen} … ${this.s.markerClose} blocks, then sync.`, 12000);
-    return "conflict";
-  }
-
-  async unresolved(path: string, wpath: string, remote: Remote): Promise<Outcome> {
-    const st = this.data.state[path];
-    if (st && remote.ver !== st.ver && hash(remote.content) !== st.hash) {
-      await this.writeLocal(path.replace(/\.md$/, CONFLICT_SUFFIX), remote.content);
-      new Notice(`Diesel: ${wpath} changed again on the reactor (v${remote.ver}) while the note has unresolved ` +
-        `conflict markers — conflict copy refreshed; resolve the markers, then sync to re-merge.`, 12000);
-    }
-    return "unresolved";
   }
 
   // ---------- commands ----------
@@ -800,16 +825,22 @@ export default class DieselSyncPlugin extends Plugin {
     } catch { return false; }
   }
 
+  // the status bar's link while drafts wait in d2: the one draft, or the Drafts page of the first project holding them
+  draftLink(): string {
+    const w = this.draftNotes; if (!w.length) return "";
+    return w.length === 1 ? this.draftPage(w[0]) : `${this.baseUrl(w[0].split(".")[0])}/drafts`;
+  }
+
   summarize(results: Record<string, number>, errors: string[], tail = "") {
-    const parts = Object.entries(results).filter(([, n]) => n).map(([k, n]) => `${n} ${k === "d1" ? "d1 (left alone, d1 sync is off)" : k}`);
+    const parts = Object.entries(results).filter(([, n]) => n).map(([k, n]) => `${n} ${k === "d1" ? "d1 (left alone, d1 sync is off)" : k === "draft" ? "draft pending" : k}`);
     const msg = parts.length ? parts.join(", ") : "nothing to sync";
-    this.setStatus(`${msg}${tail} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`);
+    this.setStatus(`${msg}${tail} · ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`, this.draftLink());
     return msg + (errors.length ? `\n${errors.length} error(s):\n${errors.slice(0, 5).join("\n")}` : "");
   }
 
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
-      this.unresolvedNotes = []; this.refused.clear(); this.skipsSaid.clear(); this.issues.clear(); this.clean.clear(); this.loginRefused.clear();
+      this.unresolvedNotes = []; this.draftNotes = []; this.refused.clear(); this.skipsSaid.clear(); this.issues.clear(); this.clean.clear(); this.loginRefused.clear();
       const results: Record<string, number> = {};
       const errors: string[] = [];
       const initial: string[] = [];
@@ -899,10 +930,10 @@ export default class DieselSyncPlugin extends Plugin {
     await this.run("syncing…", async () => {
       const w = this.wpathFor(f);
       if (!w) { new Notice('Diesel: not linked to a topic — use "Push current note"'); this.setStatus("idle"); return; }
-      this.unresolvedNotes = [];
-      const o = await this.syncPair(f.path, w);
-      new Notice(`Diesel: ${w} — ${o === "d1" ? "d1's, left alone (d1 sync is off)" : o}` + (o === "unresolved" ? ` — leftover marker at line ${this.markerLine(await this.app.vault.read(f))}` : ""));
-      this.setStatus(`${o} · ${w}`);
+      this.unresolvedNotes = []; this.draftNotes = [];
+      const o = await this.syncPair(f.path, w), said = o === "d1" ? "d1's, left alone (d1 sync is off)" : o === "draft" ? "draft pending" : o;
+      new Notice(`Diesel: ${w} — ${said}` + (o === "unresolved" ? ` — leftover marker at line ${this.markerLine(await this.app.vault.read(f))}` : ""));
+      this.setStatus(`${said} · ${w}`, this.draftLink());
     });
   }
 
@@ -1021,13 +1052,22 @@ export default class DieselSyncPlugin extends Plugin {
     return root.children.filter((c): c is TFolder => c instanceof TFolder && !hasNote(c)).map((c) => c.name);
   }
 
-  async forcePush(f: TFile) {
+  // "push as draft now" (0.9.0, was force push): the note is saved as its topic's draft whatever d2 holds, over any draft
+  // there; a d1 realm has no drafts, so there it is saved onto the topic, as force push did
+  async pushDraftNow(f: TFile) {
     await this.run("pushing…", async () => {
       const w = this.wpathFor(f);
       if (!w) throw new Error("not linked to a topic");
       const local = await this.app.vault.read(f);
-      if (this.hasMarkers(local)) throw new Error("the note still has conflict markers — resolve them first (or force pull to discard local)");
+      if (this.hasMarkers(local)) throw new Error("the note still has conflict markers — edit them out first (or force pull to discard local)");
       const remote = await this.getRemote(w);
+      if (this.d2(w.split(".")[0])) {
+        this.draftNotes = [];
+        await this.pushDraft(f.path, w, local, remote);
+        new Notice(`Diesel: ${w} — saved as a draft in d2; publish it there`);
+        this.setStatus(`draft pending · ${w}`, this.draftLink());
+        return;
+      }
       await this.write(remote ? "update" : "create", w, local);
       const r = await this.confirm(w, remote?.ver ?? 0, hash(local));
       await this.record(f.path, w, r.ver, local);
@@ -1046,7 +1086,7 @@ export default class DieselSyncPlugin extends Plugin {
       await this.app.vault.modify(f, remote.content);
       await this.record(f.path, w, remote.ver, remote.content);
       await this.dropConflictCopy(f.path);
-      new Notice(`Diesel: ${w} — reactor copy taken`);
+      new Notice(`Diesel: ${w} — reactor copy taken${this.d2(w.split(".")[0]) ? " (a draft in d2 stays there)" : ""}`);
       this.setStatus(`pulled · ${w}`);
     });
   }
@@ -1128,7 +1168,7 @@ class DieselSettingTab extends PluginSettingTab {
 
     new Setting(containerEl).setName("Sync only local edits")
       .setDesc("Avoid multi-obsidian sync issues: with Obsidian Sync on several devices, only notes typed in on this device are " +
-        "pushed or merged; changes arriving from other devices are left to them. Off: every change syncs, as before.")
+        "pushed; changes arriving from other devices are left to them. Off: every change syncs, as before.")
       .addToggle((t) => t.setValue(s.syncOnlyLocalEdits).onChange(async (v) => { s.syncOnlyLocalEdits = v; await save(); }));
 
     new Setting(containerEl).setName("Delete notes whose topic was deleted")
@@ -1146,15 +1186,6 @@ class DieselSettingTab extends PluginSettingTab {
       .addToggle((t) => t.setValue(s.logOnErrors).onChange(async (v) => { s.logOnErrors = v; await save(); }));
     new Setting(containerEl).setName("Device name").setDesc("How this device shows in the log (blank: iPad, phone or desktop).")
       .addText((t) => t.setValue(s.deviceName).onChange(async (v) => { s.deviceName = v.trim(); await save(); }));
-
-    containerEl.createEl("h3", { text: "Conflicts" });
-    new Setting(containerEl).setName("Merge conflicts into the note")
-      .setDesc("On: edits on both sides are three-way merged; overlapping hunks are marked in the note and the reactor copy is saved as " +
-        "<name>.diesel-conflict.md. A note with markers is never pushed. Off: conflict copy only.")
-      .addToggle((t) => t.setValue(s.inlineConflicts).onChange(async (v) => { s.inlineConflicts = v; await save(); }));
-    new Setting(containerEl).setName("Conflict markers").setDesc("Open / close markers (markdown-inert; avoid ===, >>> and ---).")
-      .addText((t) => t.setPlaceholder("vvvvvvv").setValue(s.markerOpen).onChange(async (v) => { s.markerOpen = v.trim() || DEFAULTS.markerOpen; await save(); }))
-      .addText((t) => t.setPlaceholder("^^^^^^^").setValue(s.markerClose).onChange(async (v) => { s.markerClose = v.trim() || DEFAULTS.markerClose; await save(); }));
 
     containerEl.createEl("h3", { text: "New topics and auto-sync" });
     new Setting(containerEl).setName("Visibility for new topics")

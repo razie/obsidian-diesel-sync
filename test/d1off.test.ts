@@ -14,6 +14,9 @@ const remote = new Map<string, string>(), asked: string[] = [], written: string[
 };
 (p as any).write = async (_k: string, w: string, c: string) => { written.push(w); remote.set(w, c); };
 (p as any).confirm = async () => ({ ver: 3 });
+const drafted: string[] = [];   // 0.9.0: a d2 note's edits go as drafts
+(p as any).getDraft = async () => null;
+(p as any).putDraft = async (w: string, c: string) => { drafted.push(w); return { text: c, dver: 1, etag: '"d1"' }; };
 (p as any).tagQuery = async (realm: string) => { queried.push(realm); return []; };
 const st = (path: string, wpath: string, text: string, host?: string) => {
   vault.files.set(path, text); p.data.state[path] = { wpath, ver: 1, hash: (p as any).constructor && "", at: 0, ...(host ? { host } : {}) } as any;
@@ -34,7 +37,7 @@ const st = (path: string, wpath: string, text: string, host?: string) => {
   check("2 d1 category in a d2 folder (400): left alone", vault.files.has("RazInvest/Cards/Card-A.md") && !written.includes("metals.CompanyCard:A"));
   check("3 old link missing on d2: not deleted, not recreated", vault.files.has("Diesel/metals/Topic/Old.md") && !written.includes("metals.Topic:Old"));
   check("4 old link found on d2: adopted (host recorded)", p.data.state["Diesel/metals/Topic/Same.md"]?.host === "metals.ai-putty.com");
-  check("5 a new note in the d2 folder is created", written.includes("metals.Topic:New"));
+  check("5 a new note in the d2 folder goes as a draft of a new topic", drafted.includes("metals.Topic:New") && !written.includes("metals.Topic:New"));
   check("6 no tag query for d1 realms", !queried.includes("other") && !queried.includes("empty1"), queried.join(","));
   // 7 a note last synced with d1 (host dieselapps) is left alone even though d2 has the name
   p.data.state["Diesel/metals/Topic/Same.md"].host = "metals.dieselapps.com"; asked.length = 0; remote.set("metals.Topic:Same", "# changed on d2\n");

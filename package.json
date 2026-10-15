@@ -1,16 +1,16 @@
 {
   "name": "diesel-sync",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "description": "Obsidian plugin: two-way sync of notes with topics on DieselApps reactors",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "npm run -s test:merge && npm run -s test:deletes && npm run -s test:d1off && npm run -s test:skips",
+    "test": "npm run -s test:drafts && npm run -s test:deletes && npm run -s test:d1off && npm run -s test:skips",
     "test:live": "esbuild test/live.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/live.js --log-level=warning && node test/.out/live.js",
     "test:initial": "esbuild test/initial.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/initial.js --log-level=warning && node test/.out/initial.js",
     "version": "node version-bump.mjs && git add manifest.json versions.json",
-    "test:merge": "esbuild test/merge.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/merge.js --log-level=warning && node test/.out/merge.js",
+    "test:drafts": "esbuild test/drafts.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/drafts.js --log-level=warning && node test/.out/drafts.js",
     "test:d2": "esbuild test/d2.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/d2.js --log-level=warning && node test/.out/d2.js",
     "test:deletes": "esbuild test/deletes.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/deletes.js --log-level=warning && node test/.out/deletes.js",
     "test:d1off": "esbuild test/d1off.test.ts --bundle --platform=node --format=cjs --alias:obsidian=./test/obsidian-mock.ts --outfile=test/.out/d1off.js --log-level=warning && node test/.out/d1off.js",
@@ -29,8 +29,5 @@
     "esbuild": "^0.25.0",
     "obsidian": "latest",
     "typescript": "^5.6.0"
-  },
-  "dependencies": {
-    "node-diff3": "^3.2.1"
   }
 }

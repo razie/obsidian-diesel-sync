@@ -7,20 +7,11 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
 - A note's body is the topic's content, byte for byte. The plugin adds no frontmatter; the note-to-topic link, last-synced version and content hash live in the plugin's data file.
 - On sync, each side is compared against the last sync: a local-only change is pushed, a remote-only change is pulled.
 - **Pull new topics** (setting, on by default): every Sync all re-runs the pull query for each realm folder and pulls matching topics that aren't in the vault yet, i.e. ones created on the reactor after the initial pull. A synced note you delete locally goes on an ignore list so it isn't pulled straight back (the topic on the reactor is never deleted); **Pull topics by tag…** fetches it again and takes it off the list.
-- **Sync only local edits** (setting, off by default): avoid multi-obsidian sync issues. With Obsidian Sync on several devices, each running Diesel Sync, only notes typed in on *this* device are pushed or merged; a change that arrived from another device is left to that device (reported as "elsewhere"). Remote-only changes still pull everywhere. Edits made outside Obsidian (other editors, scripts) don't count as typed — use **Push current note** for those.
-- A change on both sides is three-way merged against the last-synced text (kept in `.obsidian/plugins/diesel-sync/base/`). Non-overlapping edits merge cleanly and the result is pushed. Overlapping hunks are marked in the note, and the reactor copy is saved next to it as `<name>.diesel-conflict.md`:
-
-  ```
-  vvvvvvv obsidian
-  your lines
-  ^^^^^^^ vs vvvvvvv diesel v14
-  reactor lines
-  ^^^^^^^ end
-  ```
-
-  The markers are markdown-inert (git's `=======` / `>>>>>>>` would render as a heading and a blockquote) and configurable. A note that still has markers is never pushed; once you've edited them out, the next sync pushes the resolution, or re-merges if the topic moved again meanwhile. Without a base (e.g. a note first paired with an existing, different topic) every difference is marked. **Keep local (force push)** and **Take reactor copy (force pull)** still work as escape hatches; force push refuses while markers remain. Turn inline merging off in settings to get the old conflict-copy-only behaviour.
+- **Sync only local edits** (setting, off by default): avoid multi-obsidian sync issues. With Obsidian Sync on several devices, each running Diesel Sync, only notes typed in on *this* device are pushed (as drafts on d2); a change that arrived from another device is left to that device (reported as "elsewhere"). Remote-only changes still pull everywhere. Edits made outside Obsidian (other editors, scripts) don't count as typed — use **Push current note** for those.
+- **d2 wins; local edits go as drafts** (0.9.0): on a d2 project, a local edit is saved as your **draft** of the topic (`PUT /api/v2/drafts/<topic>`), never onto the topic: you review and publish it in d2. While the note equals its draft nothing is pushed or pulled, and the status bar says *draft pending*; click it to open the draft in d2. Once the draft is published the note syncs back as in sync. When d2 moves under a local edit or a pending draft (a newer published version), **d2 wins**: the note takes d2's text and your text is saved beside it as `<name>.local-conflict.md` (one notice: *d2 changed X; your version is in X.local-conflict.md*); the draft stays in d2 for you to discard or redo. A draft discarded in d2 makes the note follow the topic (your text again goes to `.local-conflict.md`); a draft changed in d2 makes the note follow the draft. A new note becomes a draft of a new topic. d1 reactors have no drafts: there a local edit is saved onto the topic as before, and a clash keeps the reactor's text with yours in `.local-conflict.md`.
+- **For people who used the merge (0.8 and before):** there is no three-way merge and no conflict markers any more; nothing is merged into a note. The *Merge conflicts into the note* and *Conflict markers* settings are gone, and **Keep local (force push)** became **Push current note as a draft now** (on d1 it still saves onto the topic). A note still carrying old `vvvvvvv obsidian` markers is never pushed: edit them out, or let d2 win when the topic next changes. Old `.diesel-conflict.md` copies are removed as their notes sync; `.local-conflict.md` copies are yours to delete. The `base/` cache in the plugin folder is no longer used and can be deleted.
 - Nothing is ever deleted on the reactor. Deleting a note only unlinks it.
-- **Delete notes whose topic was deleted** (setting, on by default, 0.5.0): when a synced topic is deleted on d1 or d2, its note goes to the vault's trash (`.trash`, recoverable). A note edited since the last sync is kept and listed instead; delete it yourself, or **Force push** to recreate the topic. Sync all won't delete more than 3 notes of one realm at once when they're also over a quarter of its linked notes (a wrong URL or login answers "not found" for everything): it reports them instead.
+- **Delete notes whose topic was deleted** (setting, on by default, 0.5.0): when a synced topic is deleted on d1 or d2, its note goes to the vault's trash (`.trash`, recoverable). A note edited since the last sync is kept and listed instead; delete it yourself, or **Push current note** to recreate the topic. Sync all won't delete more than 3 notes of one realm at once when they're also over a quarter of its linked notes (a wrong URL or login answers "not found" for everything): it reports them instead.
 - If the reactor answers a read with a topic from a different realm (realm-inheritance fallback), the plugin refuses to write it.
 
 ## Where notes live
@@ -45,7 +36,7 @@ Since 0.4.0 the plugin also syncs d2 projects, which have their own API. List th
 
 ## Commands
 
-Sync all (also on the ribbon), sync current note, push current note (create or link to a wpath), pull topic by wpath, pull by tag (`realm/tag1/tag2`), open current note on the reactor, and the two conflict resolvers. Optional auto-sync every N minutes.
+Sync all (also on the ribbon), sync current note, push current note (create or link to a wpath), pull topic by wpath, pull by tag (`realm/tag1/tag2`), open current note on the reactor, **push current note as a draft now** (over any draft in d2) and **take the reactor copy (force pull)**. Optional auto-sync every N minutes.
 
 ## Install
 
@@ -60,7 +51,7 @@ Then set the reactor user and password in the plugin settings. They're stored in
 npm install
 npm run dev       # watch build to main.js
 npm run build     # typecheck + production build
-npm run test:merge  # offline merge unit tests
+npm test          # the offline tests: drafts, deletes, d1off, skips
 DIESEL_AUTH=<base64 user:pass> npm run test:live   # end-to-end against metals, scratch topics tagged claude,test, cleaned up after
 ```
 
@@ -96,4 +87,4 @@ What a sync leaves out on purpose is counted as **skipped** and said once in the
 
 ## Pop-ups only for what's new (0.8.2)
 
-An auto-sync no longer pops the same notice every interval. It notices only what the previous sync didn't have: a new error, conflict or leftover-marker note (keyed by note and status), a new pull, a delete or a kept note. A failure that repeats unchanged is shown once, then counted in the status bar (`… · 1 error (repeating)`) and logged as before; it notices again once that note has synced clean and the failure comes back, or once a day while it lasts. The repeats are kept in the plugin's data, so a restart doesn't re-notify. A realm that refuses the login gets one notice a day naming the fix (*make a new token at https://<realm>.ai-putty.com/ai/tokens*). A d1 realm that d2 also has as a project (d2's health names it) gets one notice a day saying to add it to **d2 projects**: nothing is moved, since the two copies may differ. A manual **Sync all** always shows its summary. `npm test` runs the offline tests (merge, deletes, d1off, skips).
+An auto-sync no longer pops the same notice every interval. It notices only what the previous sync didn't have: a new error, conflict or leftover-marker note (keyed by note and status), a new pull, a delete or a kept note. A failure that repeats unchanged is shown once, then counted in the status bar (`… · 1 error (repeating)`) and logged as before; it notices again once that note has synced clean and the failure comes back, or once a day while it lasts. The repeats are kept in the plugin's data, so a restart doesn't re-notify. A realm that refuses the login gets one notice a day naming the fix (*make a new token at https://<realm>.ai-putty.com/ai/tokens*). A d1 realm that d2 also has as a project (d2's health names it) gets one notice a day saying to add it to **d2 projects**: nothing is moved, since the two copies may differ. A manual **Sync all** always shows its summary. `npm test` runs the offline tests (drafts, deletes, d1off, skips).
