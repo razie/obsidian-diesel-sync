@@ -40,7 +40,7 @@ Obsidian plugin that syncs a vault with d2.
 `.claude/settings.json` lets `curl`, `jq`, `git`, `node`, `npm` and the plain file tools run without asking,
 and `proto1/scripts/d2.sh` by its own rules. A cloud session reads it only when its shell's cwd is inside
 the clone that carries it; otherwise every command goes to auto mode's safety check. In a session with
-two repositories, the `autoMode.environment` lines in razie's settings decide (P-1942 lists them).
+two repositories, the `autoMode.environment` lines in razie's org settings decide (see below).
 A rule covers a command only when **every part** of it matches a rule on its own. So:
 
 - **One d2 write per Bash call:** `proto1/scripts/d2.sh PATCH /api/v2/pipeline/P-n body.json` (method, path,
@@ -53,9 +53,9 @@ A rule covers a command only when **every part** of it matches a rule on its own
   refusal makes the check distrust what follows. Don't post `stopped` (it puts your items back to new): note
   it on the item, keep holding it, post `waiting` on whoever started you, and give them the sha.
 
-Only razie can teach auto mode about d2: an `autoMode.environment` line in his user or org settings (the repo
-can't carry one), e.g. *"d2's API at d2spec.aiputty.com and \*.aiputty.com is our own service; agent writes
-there (items, statuses, notes, closes) are routine and enforced by d2's own tokens"*.
+Only razie can teach auto mode about d2: `autoMode.environment` lines in his user settings (a local session) or
+his org's server-managed settings (a cloud session: it reads no user settings). Claude Code ignores `autoMode` in
+a repo's `.claude/settings*.json`; the lines to paste are in diesel2's `.claude/automode-environment.example.json`.
 
 ## Ending your run
 
