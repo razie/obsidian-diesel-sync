@@ -4,23 +4,26 @@
 
 ## Start
 
-1. **Your token.** Use the token your person gave you for your role. It's kept in their vault as `d2-<role>`; never print it, paste it into a file, or put it in a commit. A role token only mints: mint your own agent token first, `POST /api/v2/tokens/agent {name: "<role>"}` with the role token, and work with that.
-2. **Your skills:** `GET https://d2spec.aiputty.com/api/v2/skills/d3?role=<role>` with `Authorization: Bearer <agent token>` and `D2-Agent: <your agent name>`. It returns your role's skills, the shared ones, and the project's `Skill:process`. They win over anything in this repo.
-3. **Post `up`** on the board: `POST /api/v2/agents/status {agent, role, state: "up"}`.
+1. **Your token.** Use the token your person gave you for your role. It's kept in their vault as `d2-<role>` and given to your session as `$D2_ROLE_TOKEN` or `$D2_<ROLE>` (`$D2_DESIGNER`, `$D2_CODER`…). A role token only mints: mint your own agent token with `proto1/scripts/d2-mint.sh <role>` and work with that. It keeps the agent token in `~/.d2/agent` (mode 600) and prints only your agent's name and expiry.
+2. **Your skills:** `proto1/scripts/d2.sh GET '/api/v2/skills/d3?role=<role>'`. It returns your role's skills, the shared ones, and the project's `Skill:process`. They win over anything in this repo.
+3. **Post `up`** on the board: `POST /api/v2/agents/status` with `{agent, role, state: "up", context, every, text}`: `context` is how full your context is (0–100), `every` the seconds until your next status (a designer's is at least 1), `text` a line on what you're doing. Every status needs `context` and `every`.
 4. **Then read what's waiting for you:** `GET /api/v2/agents/next?wait=1` (work, mail, a chat asked of you) and the open items for your role, a handover from the last agent first (`GET /api/v2/pipeline?forRole=<role>&status=open`).
 
 The Spec is the source of truth: <https://d2spec.aiputty.com/topics/Spec>. The architecture map: <https://d2spec.aiputty.com/topics/SystemArchitecture>.
 
-The first two steps, ready to paste (the role token in `$D2_ROLE_TOKEN`; nothing is printed):
+The first three steps, one command each (no token is printed):
 
 ```sh
-D2=https://d2spec.aiputty.com
-R=$(curl -sS -X POST "$D2/api/v2/tokens/agent" -H "Authorization: Bearer $D2_ROLE_TOKEN" -H 'Content-Type: application/json' -d '{"name":"<role>"}')
-export D2_TOKEN=$(echo "$R" | jq -r .token) D2_AGENT=$(echo "$R" | jq -r .agent)   # also .expires
-curl -sS "$D2/api/v2/skills/d3?role=<role>" -H "Authorization: Bearer $D2_TOKEN" -H "D2-Agent: $D2_AGENT"
+proto1/scripts/d2-mint.sh <role>                          # → {"agent":"<role>-n","expires":…,"file":"~/.d2/agent"}
+proto1/scripts/d2.sh GET '/api/v2/skills/d3?role=<role>'
+proto1/scripts/d2.sh POST /api/v2/agents/status up.json   # up.json: {"agent":"<role>-n","role":"<role>","state":"up","context":5,"every":900,"text":"starting"}
 ```
 
-Send `D2-Agent` on **every** call, not just the skills one.
+**Where the scripts find your token: your choice.** `d2.sh` and `d2-publish.sh` use `$D2_TOKEN` and `$D2_AGENT` when
+`D2_TOKEN` is set (a terminal whose environment lasts); otherwise `~/.d2/agent` (or `$D2_AGENT_FILE`), which they read
+only when it is yours and mode 600. In a session where each command starts a fresh shell, an `export` is gone by the
+next command: use the file. If you call d2 without the scripts, send `D2-Agent` on **every** call. When your token
+expires (`E_AUTH`, "mint a new one"), run `d2-mint.sh` again; you get a new agent name.
 
 ## Addresses
 
@@ -33,13 +36,13 @@ Send `D2-Agent` on **every** call, not just the skills one.
 
 **This is a copy of diesel2's `AGENTS.md`** (P-1942), so a session with both repositories finds the same start
 whichever one it opens in. The scripts below live in the **diesel2** clone: from here they are
-`../diesel2/proto1/scripts/d2.sh`, and this repo's `.claude/settings.json` allows them by that path (and by
+`../diesel2/proto1/scripts/d2.sh` (and `d2-mint.sh`, `d2-publish.sh` beside it), and this repo's `.claude/settings.json` allows them by that path (and by
 `diesel2/…` and `/home/user/diesel2/…`). The "What's in this repo" section below is diesel2's; this repo is the
 Obsidian plugin that syncs a vault with d2. A change to this file or `.claude/settings.json` goes to both
 repositories, under one P-n.
 
 `.claude/settings.json` lets `curl`, `jq`, `git`, `node`, `npm` and the plain file tools run without asking,
-and `proto1/scripts/d2.sh` by its own rules. A cloud session reads it **only with diesel2 as its one
+and `proto1/scripts/d2.sh`, `d2-mint.sh` and `d2-publish.sh` by their own rules. A cloud session reads it **only with diesel2 as its one
 repository and the shell's cwd inside the clone**; otherwise every command goes to auto mode's safety check.
 A rule covers a command only when **every part** of it matches a rule on its own. So:
 
@@ -48,13 +51,20 @@ A rule covers a command only when **every part** of it matches a rule on its own
   `$(…)`, `&&` or `VAR=… ` prefix around a write.
 - **Build the payload in a file first** (`.json`, or `.md` for a topic), in a call of its own.
 - **Many topics:** one call per topic to `proto1/scripts/d2-publish.sh <host> <topic> <file>`.
-- **Tokens come from the environment** (`$D2_TOKEN`, `$D2_AGENT`, exported at the start), never as arguments.
+- **Your agent token lives in one of two places:** the environment (`$D2_TOKEN`, `$D2_AGENT`) or `~/.d2/agent`
+  (mode 600, written by `d2-mint.sh`). Never as an argument, never in the repo, a commit, a payload or a log.
 - **Box and repo tokens: let the tool fetch them.** Don't read a vault entry into a file yourself; use a tool that
   takes it from the vault with your agent token and never shows it (`proto1/scripts/deploy.sh --box <name>`). Without
   razie's auto-mode lines, a session with two repositories refuses a vault read into a file: name the step skipped.
-- **A refusal is final**, from the session's check or from d2. Never retry it in another form: a retry after a
-  refusal makes the check distrust what follows. Don't post `stopped` (it puts your items back to new): note
+- **A refusal is final**: one from the session's check, or one where d2 refuses the action itself (`E_SCOPE`,
+  `E_NOT_YOURS`, `E_STATE`, a lane or permission error, an approval it holds). Never retry it in another form: a retry
+  after a refusal makes the check distrust what follows. Don't post `stopped` (it puts your items back to new): note
   it on the item, keep holding it, post `waiting` on whoever started you, and give them the sha.
+- **A malformed request is not a refusal.** An `E_ARG` (400) that names a missing or wrong field (`details.field`,
+  `missing`, `want`) means your payload was wrong: fix that field and send it again, once per fix.
+- **When the session loads no allow rules** (more than one repository, or the shell outside the clone), every command
+  goes to the safety check. The rules above still hold, and they're what keeps the check's trust: the scripts by
+  their full path (`/home/user/diesel2/proto1/scripts/d2.sh …`), one write per call, payloads in files.
 
 Only razie can teach auto mode about d2: `autoMode.environment` lines in his user settings (a local session) or
 his org's server-managed settings (a cloud session: it reads no user settings). Claude Code ignores `autoMode` in

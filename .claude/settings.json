@@ -2,11 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(../diesel2/proto1/scripts/d2-publish.sh *)",
+      "Bash(../diesel2/proto1/scripts/d2-mint.sh *)",
       "Bash(../diesel2/proto1/scripts/d2.sh *)",
       "Bash(./proto1/scripts/d2-publish.sh *)",
       "Bash(./proto1/scripts/d2.sh *)",
       "Bash(./scripts/d2.sh *)",
       "Bash(/home/user/diesel2/proto1/scripts/d2-publish.sh *)",
+      "Bash(/home/user/diesel2/proto1/scripts/d2-mint.sh *)",
       "Bash(/home/user/diesel2/proto1/scripts/d2.sh *)",
       "Bash([ *)",
       "Bash(bash ../diesel2/proto1/scripts/d2.sh *)",
@@ -30,6 +32,7 @@
       "Bash(curl -sS https://d2spec.aiputty.com/api/v2/vault/d2-demigod *)",
       "Bash(date *)",
       "Bash(diesel2/proto1/scripts/d2-publish.sh *)",
+      "Bash(diesel2/proto1/scripts/d2-mint.sh *)",
       "Bash(diesel2/proto1/scripts/d2.sh *)",
       "Bash(diff *)",
       "Bash(echo *)",
