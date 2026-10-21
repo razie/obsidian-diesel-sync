@@ -35,12 +35,12 @@ Send `D2-Agent` on **every** call, not just the skills one.
 whichever one it opens in. The scripts below live in the **diesel2** clone: from here they are
 `../diesel2/proto1/scripts/d2.sh`, and this repo's `.claude/settings.json` allows them by that path (and by
 `diesel2/…` and `/home/user/diesel2/…`). The "What's in this repo" section below is diesel2's; this repo is the
-Obsidian plugin that syncs a vault with d2.
+Obsidian plugin that syncs a vault with d2. A change to this file or `.claude/settings.json` goes to both
+repositories, under one P-n.
 
 `.claude/settings.json` lets `curl`, `jq`, `git`, `node`, `npm` and the plain file tools run without asking,
-and `proto1/scripts/d2.sh` by its own rules. A cloud session reads it only when its shell's cwd is inside
-the clone that carries it; otherwise every command goes to auto mode's safety check. In a session with
-two repositories, the `autoMode.environment` lines in razie's org settings decide (see below).
+and `proto1/scripts/d2.sh` by its own rules. A cloud session reads it **only with diesel2 as its one
+repository and the shell's cwd inside the clone**; otherwise every command goes to auto mode's safety check.
 A rule covers a command only when **every part** of it matches a rule on its own. So:
 
 - **One d2 write per Bash call:** `proto1/scripts/d2.sh PATCH /api/v2/pipeline/P-n body.json` (method, path,
@@ -49,6 +49,9 @@ A rule covers a command only when **every part** of it matches a rule on its own
 - **Build the payload in a file first** (`.json`, or `.md` for a topic), in a call of its own.
 - **Many topics:** one call per topic to `proto1/scripts/d2-publish.sh <host> <topic> <file>`.
 - **Tokens come from the environment** (`$D2_TOKEN`, `$D2_AGENT`, exported at the start), never as arguments.
+- **Box and repo tokens: let the tool fetch them.** Don't read a vault entry into a file yourself; use a tool that
+  takes it from the vault with your agent token and never shows it (`proto1/scripts/deploy.sh --box <name>`). Without
+  razie's auto-mode lines, a session with two repositories refuses a vault read into a file: name the step skipped.
 - **A refusal is final**, from the session's check or from d2. Never retry it in another form: a retry after a
   refusal makes the check distrust what follows. Don't post `stopped` (it puts your items back to new): note
   it on the item, keep holding it, post `waiting` on whoever started you, and give them the sha.
