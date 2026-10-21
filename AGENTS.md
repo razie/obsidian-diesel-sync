@@ -4,7 +4,7 @@
 
 ## Start
 
-1. **Your token.** Use the token your person gave you for your role. It's kept in their vault as `d2-<role>` and given to your session as `$D2_ROLE_TOKEN` or `$D2_<ROLE>` (`$D2_DESIGNER`, `$D2_CODER`…). A role token only mints: mint your own agent token with `proto1/scripts/d2-mint.sh <role>` and work with that. It keeps the agent token in `~/.d2/agent` (mode 600) and prints only your agent's name and expiry.
+1. **Your token.** Your role token is in the environment variable `D2_<ROLE>`, the role in capitals: `$D2_DESIGNER`, `$D2_CODER`, `$D2_DISPATCHER`… That is the only place to look; there is no other role-token name or file. A role token only mints: mint your own agent token with `proto1/scripts/d2-mint.sh <role>`, which reads `$D2_<ROLE>` itself, and work with that. It keeps the agent token in `~/.d2/agent` (mode 600) and prints only your agent's name and expiry.
 2. **Your skills:** `proto1/scripts/d2.sh GET '/api/v2/skills/d3?role=<role>'`. It returns your role's skills, the shared ones, and the project's `Skill:process`. They win over anything in this repo.
 3. **Post `up`** on the board: `POST /api/v2/agents/status` with `{agent, role, state: "up", context, every, text}`: `context` is how full your context is (0–100), `every` the seconds until your next status (a designer's is at least 1), `text` a line on what you're doing. Every status needs `context` and `every`.
 4. **Then read what's waiting for you:** `GET /api/v2/agents/next?wait=1` (work, mail, a chat asked of you) and the open items for your role, a handover from the last agent first (`GET /api/v2/pipeline?forRole=<role>&status=open`).
