@@ -56,10 +56,16 @@ A rule covers a command only when **every part** of it matches a rule on its own
 - **Box and repo tokens: let the tool fetch them.** Don't read a vault entry into a file yourself; use a tool that
   takes it from the vault with your agent token and never shows it (`proto1/scripts/deploy.sh --box <name>`). Without
   razie's auto-mode lines, a session with two repositories refuses a vault read into a file: name the step skipped.
-- **A refusal is final**: one from the session's check, or one where d2 refuses the action itself (`E_SCOPE`,
-  `E_NOT_YOURS`, `E_STATE`, a lane or permission error, an approval it holds). Never retry it in another form: a retry
-  after a refusal makes the check distrust what follows. Don't post `stopped` (it puts your items back to new): note
-  it on the item, keep holding it, post `waiting` on whoever started you, and give them the sha.
+- **A refusal is final**, but for one way through it that d2 itself offers, on your person's word. When they asked
+  for the action: (1) no intent was read from their message (nothing under it, or `⇒ …(?)`): ask them to say it
+  plainly so d2 reads one, then send the call citing it (`D2-Intent: <id>`); (2) refused even so, and the refusal
+  offers an Allow once (`details.overridable: true`, or its message names `POST /api/v2/overrides`): ask it at once
+  (`POST /api/v2/overrides {action, target, refused: {code, rule}, why, chat}`; `details.override` is that body but
+  for `why`, their ask in their words), tell them to tap it, and repeat the same call with `override: <id>`. Anything
+  else, one from the session's check or one where d2 refuses the action itself (`E_SCOPE`, `E_NOT_YOURS`, `E_STATE`,
+  a lane or permission error, an approval it holds), is final: never retry it in another form; a retry after a
+  refusal makes the check distrust what follows. Don't post `stopped` (it puts your items back to new): note it on
+  the item, keep holding it, post `waiting` on whoever started you, and give them the sha.
 - **A malformed request is not a refusal.** An `E_ARG` (400) that names a missing or wrong field (`details.field`,
   `missing`, `want`) means your payload was wrong: fix that field and send it again, once per fix.
 - **When the session loads no allow rules** (more than one repository, or the shell outside the clone), every command
