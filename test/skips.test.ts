@@ -56,7 +56,7 @@ async function repeats() {
     if (w.startsWith("d2spec.")) throw new Error(`read ${w}: HTTP 401 (log in: user/password, or a token for this project)`);
     return { realm: w.split(".")[0], category: "Topic", name: w.split(":")[1], content: "# x\n", ver: 1, tags: [] };
   };
-  (q as any).http = async (o: { url: string }) => /metals\.ai-putty\.com\/api\/v2\/health/.test(o.url) && isD2 ? { status: 200, json: { ok: true, project: "metals" }, text: "" } : { status: 404, json: null, text: "" };
+  (q as any).http = async (o: { url: string }) => /metals\.aiputty\.com\/api\/v2\/health/.test(o.url) && isD2 ? { status: 200, json: { ok: true, project: "metals" }, text: "" } : { status: 404, json: null, text: "" };
   (q as any).autoUpload = async () => {}; (q as any).saveLog = async () => {};
   await q.onload();
   Object.assign(q.data.settings, { user: "u", password: "p", d1Sync: true, d2Projects: "", initialPullQuery: "", pullNewTopics: false, logOnErrors: false });
@@ -91,7 +91,7 @@ async function repeats() {
   q.data.settings.d2Projects = "d2spec = d2t_x"; link("Diesel/d2spec/Topic/Spec.md", "d2spec.Topic:Spec"); link("Diesel/d2spec/Topic/Other.md", "d2spec.Topic:Other");
   at = n0(); await quiet(3);
   check("c1 refused login on 3 quiet syncs: 1 notice in all", notices.length - at === 1, notices.slice(at).join(" | "));
-  check("c2 it names the fix", said(at, /d2spec refused the token: make a new one at https:\/\/d2spec\.ai-putty\.com\/ai\/tokens and put it on its line/) === 1, notices.slice(at).join(" | "));
+  check("c2 it names the fix", said(at, /d2spec refused the token: make a new one at https:\/\/d2spec\.aiputty\.com\/ai\/tokens and put it on its line/) === 1, notices.slice(at).join(" | "));
   now += 86_400_000; at = n0(); await quiet(2);
   check("c3 the next day: said once more", said(at, /d2spec refused the token/) === 1, notices.slice(at).join(" | "));
   q.data.settings.d2Projects = ""; v.files.delete("Diesel/d2spec/Topic/Spec.md"); v.files.delete("Diesel/d2spec/Topic/Other.md");
