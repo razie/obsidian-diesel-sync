@@ -39,8 +39,8 @@ interface Settings {
   password: string;
   baseUrlPattern: string;   // {realm} is replaced, e.g. https://{realm}.dieselapps.com
   baseUrlOverrides: string; // lines: realm = https://host
-  d2Projects: string;       // d2 (ai-putty.com) projects, one per line: project [= AI token]; the rest are d1 realms
-  d2UrlPattern: string;     // {realm} is replaced by the project, e.g. https://{realm}.ai-putty.com
+  d2Projects: string;       // d2 (aiputty.com) projects, one per line: project [= AI token]; the rest are d1 realms
+  d2UrlPattern: string;     // {realm} is replaced by the project, e.g. https://{realm}.aiputty.com
   d1Sync: boolean;          // off: only the d2 projects sync; d1 realms and d1-linked notes are left alone (0.7.0)
   rootFolder: string;       // generic layout: <root>/<realm>/<Category>/<name>.md
   defaultRealm: string;
@@ -79,14 +79,18 @@ interface PluginData {
   ignored: string[]; // wpaths whose synced note was deleted locally: not re-pulled as "new" (Pull by tag still fetches them)
   repeats: Record<string, number>; // 0.8.2: a quiet sync's failures (wpath|status) -> when last shown; shown again only once cleared, or a day on
   said: Record<string, number>;    // 0.8.2: once-a-day notices (a realm refusing the login, a d1 realm that is a d2 project) -> when last said
+  stopped: Record<string, Stopped>; // 0.10.0: realms the timer no longer calls (a route gone, 410, a refused token), until a sync by hand or new settings
 }
+
+// 0.10.0: why a realm was stopped, and the settings it was stopped under (`sig`): new settings start it again
+interface Stopped { why: string; at: number; sig: string }
 
 interface Remote {
   realm: string; category: string; name: string;
   content: string; ver: number; tags: string[];
 }
 
-type Outcome = "in-sync" | "pushed" | "created" | "drafted" | "draft" | "pulled" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "d1" | "error";
+type Outcome = "in-sync" | "pushed" | "created" | "drafted" | "draft" | "pulled" | "conflict" | "unresolved" | "elsewhere" | "skipped" | "deleted" | "gone" | "kept" | "d1" | "error" | "stopped";
 
 const DEFAULTS: Settings = {
   user: "",
@@ -94,7 +98,7 @@ const DEFAULTS: Settings = {
   baseUrlPattern: "https://{realm}.dieselapps.com",
   baseUrlOverrides: "",
   d2Projects: "d2spec",
-  d2UrlPattern: "https://{realm}.ai-putty.com",
+  d2UrlPattern: "https://{realm}.aiputty.com",
   d1Sync: true,
   rootFolder: "Diesel",
   defaultRealm: "metals",
@@ -121,6 +125,22 @@ const MASS_DELETE_MIN = 3, MASS_DELETE_SHARE = 0.25;
 // a note left out of a sync on purpose (0.8.1): counted as skipped and said once per `why` in the log, never an error, so
 // it doesn't upload the log after every sync
 export class Skip extends Error { constructor(msg: string, public why = msg) { super(msg); } }
+
+// a realm that answered "this will never work" (0.10.0): the call it was in stops, and so does the realm (see stop())
+export class Stop extends Error { constructor(public realm: string, public why: string) { super(`stopped syncing ${realm}: ${why}`); } }
+
+// 0.10.0: an answer that no retry on a timer can fix. A route d2 doesn't have (404 E_NOT_FOUND "no route …", or "all
+// routes are under /api/v2" for the old /api/v1), anything gone (410), a token or login d2 refuses (401 E_AUTH). A
+// missing topic or draft (404 "no topic …") is not one: that's an answer.
+export function stopWhy(r: { status: number; json?: unknown }): string | null {
+  if (r.status !== 404 && r.status !== 410 && r.status !== 401) return null;
+  type E = { error?: { code?: string; message?: string } } | null;
+  const j = ((): E => { try { return r.json as E; } catch { return null; } })();   // not JSON: d1's text answers
+  const code = j?.error?.code ?? "", msg = String(j?.error?.message ?? "").slice(0, 160);
+  if (r.status === 404) return code === "E_NOT_FOUND" && /^no route |all routes are under \/api\/v2/.test(msg) ? `that route is gone (HTTP 404: ${msg})` : null;
+  if (r.status === 410) return `gone (HTTP 410${code ? ` ${code}` : ""}${msg ? `: ${msg}` : ""})`;
+  return code === "E_AUTH" ? `the token or login was refused (HTTP 401 E_AUTH${msg ? `: ${msg}` : ""})` : null;
+}
 
 // ---------- helpers ----------
 
@@ -157,9 +177,9 @@ function safeFileName(name: string): string {
 
 // ---------- plugin ----------
 
-// d2's domain (0.8.0) and the ones it had before; the old ones redirect to it
-const D2_DOMAIN = "ai-putty.com";
-const D2_OLD = /(?<![\w-])(aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/g;
+// d2's domain (0.10.0: aiputty.com again) and the ones it had before; the old ones redirect to it (and drop auth on the way)
+const D2_DOMAIN = "aiputty.com";
+const D2_OLD = /(?<![\w-])(ai-putty\.com|aiheroapps\.com|aidieselapps\.com)\b/g;
 const D2_ANY = /(?<![\w-])(ai-putty\.com|aiheroapps\.com|aiputty\.com|aidieselapps\.com)\b/;
 const DAY = 86_400_000;
 const BASE_UNLISTED = "d2 is base d2, not a d1 reactor: list it under d2 projects (with a token) to sync it";
@@ -178,10 +198,11 @@ export default class DieselSyncPlugin extends Plugin {
       ignored: raw?.ignored ?? [],
       repeats: raw?.repeats ?? {},
       said: raw?.said ?? {},
+      stopped: raw?.stopped ?? {},
     };
     // 0.4.0: d2 has its own URL setting; a d1 pattern pointed at a d2 domain would send d1 realms (metals) there
     if (D2_ANY.test(this.data.settings.baseUrlPattern)) { this.data.settings.baseUrlPattern = DEFAULTS.baseUrlPattern; await this.saveData(this.data); }
-    // 0.8.0: d2 moved to ai-putty.com; the old domains only redirect (and drop auth on the way)
+    // 0.8.0, 0.10.0: d2 is aiputty.com; the old domains (ai-putty.com among them) only redirect (and drop auth on the way)
     if (this.migrateD2Domain()) await this.saveData(this.data);
 
     this.statusEl = this.addStatusBarItem();
@@ -300,7 +321,7 @@ export default class DieselSyncPlugin extends Plugin {
   // a d2 topic's id: the name for a Topic, else Category:name
   d2Id(p: { category: string; name: string }): string { return p.category === "Topic" ? p.name : `${p.category}:${p.name}`; }
 
-  // 0.8.0: move the d2 URL pattern, overrides and link hosts from the old d2 domains to ai-putty.com. True if changed.
+  // 0.8.0: move the d2 URL pattern, overrides and link hosts from the old d2 domains to aiputty.com. True if changed.
   migrateD2Domain(): boolean {
     const s = this.data.settings, fix = (v: string) => v.replace(D2_OLD, D2_DOMAIN);
     let changed = false;
@@ -318,7 +339,7 @@ export default class DieselSyncPlugin extends Plugin {
       const m = line.match(/^\s*([^=\s]+)\s*=\s*(\S+)\s*$/);
       if (m && m[1] === realm) return m[2].replace(/\/+$/, "");
     }
-    if (this.d2(realm)) {   // base d2 lives on the bare domain: d2.ai-putty.com -> ai-putty.com (0.7.1)
+    if (this.d2(realm)) {   // base d2 lives on the bare domain: d2.aiputty.com -> aiputty.com (0.7.1)
       const u = (this.s.d2UrlPattern || DEFAULTS.d2UrlPattern).replace(/\/+$/, "");
       return realm === "d2" ? u.replace(/\{realm\}\./, "") : u.replace("{realm}", realm);
     }
@@ -390,14 +411,44 @@ export default class DieselSyncPlugin extends Plugin {
   }
 
   // every reactor call goes through here: logged with its time, status and d2's request id (0.6.0)
-  async http(o: { url: string; method?: string; headers?: Record<string, string>; body?: string; contentType?: string; throw?: boolean }) {
+  // With `realm`, an answer no retry can fix (stopWhy) stops that realm and throws Stop (0.10.0).
+  async http(o: { url: string; method?: string; headers?: Record<string, string>; body?: string; contentType?: string; throw?: boolean; realm?: string }) {
     const t0 = Date.now(), method = o.method ?? "GET", where = o.url.replace(/^https?:\/\//, "").split("?")[0];
+    const { realm, ...req } = o;
+    let r: Awaited<ReturnType<typeof requestUrl>>;
     try {
-      const r = await requestUrl(o);
+      r = await requestUrl(req);
       const rid = (r.headers ?? {})["x-request-id"] ?? (r.headers ?? {})["X-Request-Id"];
       clientLog.add(r.status >= 500 ? "error" : r.status >= 400 && r.status !== 404 ? "warn" : "debug", `${method} ${where} ${r.status} ${Date.now() - t0}ms`, rid);
-      return r;
     } catch (e) { clientLog.add("error", `${method} ${where} failed after ${Date.now() - t0}ms: ${(e as Error).message}`); throw e; }
+    const why = realm ? stopWhy(r) : null;
+    if (realm && why) throw this.stop(realm, `${method} ${where}: ${why}`);
+    return r;
+  }
+
+  // ---------- stopped realms (0.10.0) ----------
+  // A realm whose answer no retry can fix is stopped: one notice saying why (and for a refused token, where to make a
+  // new one), kept in the plugin's data so the timer never calls it again, restarts included. A sync by hand (Sync
+  // all, or a command on a note) calls it again; so does any change to its URL, token, user or password.
+
+  // the settings a realm's calls depend on, hashed: a stop holds only while they stay the same
+  stopSig(realm: string): string { return hash(`${this.baseUrl(realm)}|${this.d2(realm)?.token ?? ""}|${this.s.user}|${this.s.password}`); }
+  isStopped(realm: string): boolean { const x = this.data.stopped[realm]; return !!x && x.sig === this.stopSig(realm); }
+  stop(realm: string, why: string): Stop {
+    const x = this.data.stopped[realm], sig = this.stopSig(realm);
+    if (!x || x.sig !== sig || x.why !== why) {
+      this.data.stopped[realm] = { why, at: this.now(), sig };
+      void this.save();
+      const fix = /E_AUTH/.test(why) && this.d2(realm) ? ` Make a new token at ${this.baseUrl(realm)}/ai/tokens and put it on its line in the settings.` : "";
+      new Notice(`Diesel: stopped syncing ${realm}: ${why}.${fix} Auto-sync won't call it again; Sync all by hand, or change its settings, to try again.`, 15000);
+    }
+    clientLog.add("error", `stopped ${realm}: ${why}`);
+    return new Stop(realm, why);
+  }
+  // d2 has no /api/v1 (0.10.0): a d1 realm whose URL is a d2 host is stopped before any v1 call goes out
+  noV1(realm: string) {
+    const host = this.hostOf(realm);
+    if (D2_ANY.test(host)) throw this.stop(realm, `${host} is d2, which has no /api/v1: list ${realm} under d2 projects (with its token) to sync it`);
   }
 
   logFile(): string { return normalizePath(`${this.manifest?.dir ?? ".obsidian/plugins/diesel-sync"}/log.json`); }
@@ -429,7 +480,7 @@ export default class DieselSyncPlugin extends Plugin {
     if (this.d1Off(p.realm)) throw new Error(`${p.realm} is a d1 realm and d1 sync is off`);
     if (this.baseUnlisted(p.realm)) throw new Skip(BASE_UNLISTED);
     if (this.d2(p.realm)) {
-      const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false });
+      const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}?format=json`, headers: this.auth(p.realm), throw: false, realm: p.realm });
       if (r.status === 404) return null;
       if (r.status === 400 && /unknown topic category/.test(r.json?.error?.message ?? ""))   // a d1-only category (CompanyCard, Reactor…)
         throw new Skip(`read ${wpath}: HTTP 400 — '${p.category}' isn't a d2 category: kept local`, `${p.realm}: '${p.category}' isn't a d2 category — its notes stay local`);
@@ -439,9 +490,10 @@ export default class DieselSyncPlugin extends Plugin {
       if (d.project && d.project !== p.realm) throw new Skip(`${wpath} is ${d.project}'s shared topic, not this project's — not syncing it`);
       return { realm: p.realm, category: p.category, name: p.name, content: d.text ?? "", ver: Number(d.ver) || 0, tags: [] };
     }
+    this.noV1(p.realm);
     const r = await this.http({
       url: `${this.baseUrl(p.realm)}/api/v1/wiki/json/${wpath}`,
-      headers: this.auth(p.realm), throw: false,
+      headers: this.auth(p.realm), throw: false, realm: p.realm,
     });
     if (r.status === 404) return null;
     if (r.status !== 200) throw new Error(`read ${wpath}: HTTP ${r.status} (401 can also mean "no such topic")`);
@@ -459,10 +511,11 @@ export default class DieselSyncPlugin extends Plugin {
     if (this.baseUnlisted(p.realm)) throw new Skip(BASE_UNLISTED);
     if (this.d2(p.realm)) {   // d2: one PUT creates or updates; the body is the markdown
       const r = await this.http({ url: `${this.baseUrl(p.realm)}/api/v2/topics/${encodeURIComponent(this.d2Id(p)).replace(/%3A/g, ":")}`, method: "PUT",
-        headers: this.auth(p.realm), contentType: "text/markdown", body: content, throw: false });
+        headers: this.auth(p.realm), contentType: "text/markdown", body: content, throw: false, realm: p.realm });
       if (r.status === 200 || r.status === 201) { if (r.json?.draft) throw new Error(`${wpath}: saved as a draft (the token writes drafts); publish it in d2`); return; }
       throw new Error(`${kind} ${wpath}: HTTP ${r.status} ${r.text.slice(0, 160)}`);
     }
+    this.noV1(p.realm);
     const we: Record<string, unknown> = { category: p.category, name: p.name, realm: p.realm, content };
     if (kind === "create") {
       Object.assign(we, {
@@ -476,7 +529,7 @@ export default class DieselSyncPlugin extends Plugin {
       headers: this.auth(p.realm),
       contentType: "application/x-www-form-urlencoded",
       body: "we=" + encodeURIComponent(JSON.stringify(we)),
-      throw: false,
+      throw: false, realm: p.realm,
     });
     if (r.status === 200) return;
     if (r.status === 404 && /no change/i.test(r.text)) return; // identical write = success
@@ -497,7 +550,7 @@ export default class DieselSyncPlugin extends Plugin {
   // this account's draft of the topic, or null when there is none
   async getDraft(wpath: string): Promise<Draft | null> {
     const p = parseWpath(wpath)!;
-    const r = await this.http({ url: `${this.draftApi(p)}?format=json`, headers: this.auth(p.realm), throw: false });
+    const r = await this.http({ url: `${this.draftApi(p)}?format=json`, headers: this.auth(p.realm), throw: false, realm: p.realm });
     if (r.status === 404) return null;
     if (r.status !== 200) throw new Error(`read the draft of ${wpath}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
     const dver = Number(r.json?.dver) || 1;
@@ -508,7 +561,7 @@ export default class DieselSyncPlugin extends Plugin {
   async putDraft(wpath: string, content: string, etag: string): Promise<Draft> {
     const p = parseWpath(wpath)!;
     const r = await this.http({ url: this.draftApi(p), method: "PUT", headers: { ...this.auth(p.realm), "If-Match": etag },
-      contentType: "text/markdown", body: content, throw: false });
+      contentType: "text/markdown", body: content, throw: false, realm: p.realm });
     if (r.status !== 200) throw new Error(`save the draft of ${wpath}: HTTP ${r.status} ${r.text.slice(0, 160)}`);
     const dver = Number(r.json?.dver) || 1;
     return { text: content, dver, etag: (r.headers ?? {})["etag"] ?? `"d${dver}"` };
@@ -789,6 +842,7 @@ export default class DieselSyncPlugin extends Plugin {
     this.busy = true; this.setStatus(label);
     try { return await fn(); }
     catch (e) {
+      if (e instanceof Stop) { this.setStatus(`stopped: ${e.realm}`); await this.saveLog(); return; }   // stop() said why
       const m = (e as Error).message, k = `run|${m}`;
       clientLog.add("error", `${label} ${(e as Error).stack ?? m}`);
       const isNew = this.fresh([k]).length > 0;
@@ -841,6 +895,13 @@ export default class DieselSyncPlugin extends Plugin {
   async syncAll(quiet = false) {
     await this.run("syncing…", async () => {
       this.unresolvedNotes = []; this.draftNotes = []; this.refused.clear(); this.skipsSaid.clear(); this.issues.clear(); this.clean.clear(); this.loginRefused.clear();
+      this.downNow.clear(); this.backedOff.clear();
+      // 0.10.0: a sync by hand calls every realm again; the timer leaves out the stopped ones and those backing off from a 5xx
+      if (!quiet) { if (Object.keys(this.data.stopped).length) { this.data.stopped = {}; await this.save(); } }
+      else {
+        for (const realm of Object.keys(this.data.stopped)) if (this.isStopped(realm)) this.refused.add(realm);
+        for (const [realm, b] of this.backoff) if (this.now() < b.until && !this.refused.has(realm)) { this.refused.add(realm); this.backedOff.add(realm); }
+      }
       const results: Record<string, number> = {};
       const errors: string[] = [];
       const initial: string[] = [];
@@ -876,7 +937,11 @@ export default class DieselSyncPlugin extends Plugin {
         const initialRealms = new Set(initial.map((x) => x.split(":")[0]));
         for (const realm of this.realmFolders().filter((r) => !initialRealms.has(r) && !this.d1Off(r) && !this.baseUnlisted(r) && !this.refused.has(r))) {
           try {
+            // 0.10.0: the timer re-lists a d2 project only when its topic counters moved since the last list
+            const revs = this.d2(realm) ? await this.topicRevs(realm) : null;
+            if (quiet && revs && this.revsSeen.get(realm) === revs) continue;
             const news = (await this.tagQuery(realm, q)).filter((w) => !seen.has(w) && !this.data.ignored.includes(w));
+            if (revs) this.revsSeen.set(realm, revs);
             if (!news.length) continue;
             this.setStatus(`pulling ${news.length} new topic(s) for ${realm}…`);
             const before = results.pulled ?? 0;
@@ -893,6 +958,8 @@ export default class DieselSyncPlugin extends Plugin {
         catch (e) { this.failed(w, e, results, errors); }
       }
       await this.applyDeletes(pairs, results, errors);
+      // a realm called this sync that didn't answer 5xx is up again: its backoff is over
+      for (const realm of [...this.backoff.keys()]) if (!this.downNow.has(realm) && !this.backedOff.has(realm)) this.backoff.delete(realm);
       // what this sync found that the last one didn't; the rest repeats, and is forgotten once its note syncs clean
       const keys = [...this.issues], news = this.fresh(keys), rep = keys.length - news.length, R = this.data.repeats;
       // gone: a note that synced clean, a thrown error (this sync got this far), a realm-wide one (`realm.`) not seen
@@ -915,7 +982,7 @@ export default class DieselSyncPlugin extends Plugin {
       for (const realm of this.loginRefused) if (this.daily(`login|${realm}`))
         new Notice(`Diesel: ${realm} refused the token: make a new one at ${this.baseUrl(realm)}/ai/tokens and put it on its line`, 12000);
       // a d1 realm d2 also has (asked once a day): say how to move it, never move it — the two copies may differ
-      const d1s = [...new Set(pairs.map(([, w]) => w.split(".")[0]))].filter((r) => !this.d2(r) && !this.d1Off(r) && !this.baseUnlisted(r));
+      const d1s = [...new Set(pairs.map(([, w]) => w.split(".")[0]))].filter((r) => !this.d2(r) && !this.d1Off(r) && !this.baseUnlisted(r) && !this.isStopped(r));
       for (const realm of d1s) if (this.daily(`d1d2|${realm}`) && await this.isD2Project(realm)) {
         clientLog.add("warn", `${realm} is synced with d1 (${this.hostOf(realm)}) but is also a d2 project`);
         new Notice(`Diesel: ${realm} is synced with d1 (${this.hostOf(realm)}), but it is also one of your d2 projects: add \`${realm}\` to *d2 projects* in settings (with its token) to sync it with d2. Nothing is moved: the two copies may differ.`, 12000);
@@ -987,23 +1054,47 @@ export default class DieselSyncPlugin extends Plugin {
     if (this.d1Off(realm)) throw new Error(`${realm} is a d1 realm and d1 sync is off`);
     if (this.baseUnlisted(realm)) throw new Skip(BASE_UNLISTED);
     if (this.d2(realm)) {   // d2: list the project's topics; a category name picks that category, other tags match the topic's tags
-      const r = await this.http({ url: `${this.baseUrl(realm)}/api/v2/topics`, headers: this.auth(realm), throw: false });
-      if (r.status !== 200) throw new Error(`list ${realm}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
-      const list: { name: string; category: string; tags?: string[] }[] = r.json?.data ?? [];
+      const list = await this.listTopics(realm);
       const cats = new Set(list.map(t => t.category.toLowerCase()));
       const want = tags.filter(t => !t.startsWith("-")), not = tags.filter(t => t.startsWith("-")).map(t => t.slice(1).toLowerCase());
       return list.filter(t => want.every(w => cats.has(w.toLowerCase()) || w.toLowerCase() === "topic" ? t.category.toLowerCase() === w.toLowerCase() : (t.tags ?? []).map(x => x.toLowerCase()).includes(w.toLowerCase()))
           && !not.some(x => (t.tags ?? []).map(y => y.toLowerCase()).includes(x) || t.category.toLowerCase() === x))
         .map(t => { const i = t.name.indexOf(":"); return i > 0 && t.category !== "Topic" ? `${realm}.${t.category}:${t.name.slice(i + 1)}` : `${realm}.Topic:${t.name}`; });
     }
+    this.noV1(realm);
     const r = await this.http({
       url: `${this.baseUrl(realm)}/api/v1/wiki/tag/${tags.map(encodeURIComponent).join("/")}`,
-      headers: this.auth(realm), throw: false,
+      headers: this.auth(realm), throw: false, realm,
     });
     if (r.status === 404) return [];
     if (r.status !== 200) throw new Error(`tag query ${realm}/${tags.join("/")}: HTTP ${r.status}`);
     return (r.json?.data ?? []).map((x: { wpath: string }) => x.wpath)
       .filter((w: string) => { const p = parseWpath(w); return p && p.realm === realm; });
+  }
+
+  // every topic of a d2 project (0.10.0): the door's list, GET /api/v2/d2/Topic, every page of it (was GET /api/v2/topics,
+  // deprecated, and only its first page read)
+  async listTopics(realm: string): Promise<{ name: string; category: string; tags?: string[] }[]> {
+    const out: { name: string; category: string; tags?: string[] }[] = [], LIMIT = 100;
+    let after = "";
+    for (let page = 0; page < 200; page++) {
+      const r = await this.http({ url: `${this.baseUrl(realm)}/api/v2/d2/Topic?fields=name,category,tags&limit=${LIMIT}${after ? `&after=${encodeURIComponent(after)}` : ""}`,
+        headers: this.auth(realm), throw: false, realm });
+      if (r.status !== 200) throw new Error(`list ${realm}: HTTP ${r.status}${r.status === 401 ? " (log in: user/password, or a token for this project)" : ""}`);
+      const data: { name: string; category: string; tags?: string[] }[] = r.json?.data ?? [], next = r.json?.next;
+      out.push(...data);
+      if (!next || data.length < LIMIT || next === after) break;
+      after = String(next);
+    }
+    return out;
+  }
+
+  // a d2 project's topic change counters (GET /api/v2/revs, its `topics`), as one string; null when it has none to give
+  async topicRevs(realm: string): Promise<string | null> {
+    try {
+      const r = await this.http({ url: `${this.baseUrl(realm)}/api/v2/revs`, headers: this.auth(realm), throw: false });
+      return r.status === 200 && r.json?.topics ? JSON.stringify(r.json.topics) : null;
+    } catch { return null; }
   }
 
   async syncList(wpaths: string[], results: Record<string, number>, errors: string[]) {
@@ -1017,11 +1108,23 @@ export default class DieselSyncPlugin extends Plugin {
   // it for every note just runs into the reactor's lockout and keeps it locked.
   // A realm answering 5xx (down, or a deploy) is left alone for the rest of the sync too (0.8.1), d1 or d2: one line, not
   // one error per note.
+  // A realm answering 5xx also backs off (0.10.0): the timer leaves it out for 2, 4, 8… of its intervals (an hour at
+  // most), until a sync reaches it and it answers again.
   refused = new Set<string>();
+  backoff = new Map<string, { n: number; until: number }>();
+  downNow = new Set<string>();     // realms that answered 5xx this sync
+  backedOff = new Set<string>();   // realms this (timer) sync left out for their backoff
+  revsSeen = new Map<string, string>();   // a d2 project's topic counters when the timer last listed it (0.10.0)
   noteRefusal(wpath: string, e: unknown) {
     const realm = wpath.split(".")[0], msg = (e as Error)?.message ?? "", down = /HTTP (5\d\d)\b/.exec(msg);
     if (this.refused.has(realm)) return;
-    if (down) { this.refused.add(realm); clientLog.add("error", `${realm} answered HTTP ${down[1]} (down, or being deployed): skipping it for the rest of this sync`); return; }
+    if (down) {
+      this.refused.add(realm); this.downNow.add(realm);
+      const n = (this.backoff.get(realm)?.n ?? 0) + 1, every = (Number(this.s.autoSyncMinutes) || 1) * 60_000;
+      this.backoff.set(realm, { n, until: this.now() + Math.min(2 ** n * every, 3_600_000) });
+      clientLog.add("error", `${realm} answered HTTP ${down[1]} (down, or being deployed): skipping it for the rest of this sync, and auto-sync backs off`);
+      return;
+    }
     // d2 only: on d1 a 401 can also mean "no such topic"
     if (this.d2(realm) && /HTTP 401\b/.test(msg)) { this.refused.add(realm); this.loginRefused.add(realm); clientLog.add("error", `${realm} refused the login: skipping it for the rest of this sync (check the user/password or the project's token)`); }
   }
@@ -1029,6 +1132,7 @@ export default class DieselSyncPlugin extends Plugin {
   // an error, and may leave its realm alone for the rest of the sync (noteRefusal)
   skipsSaid = new Set<string>();
   failed(w: string, e: unknown, results: Record<string, number>, errors: string[]) {
+    if (e instanceof Stop) { this.refused.add(e.realm); results.stopped = (results.stopped ?? 0) + 1; return; }   // stop() said why, once
     if (e instanceof Skip) {
       results.skipped = (results.skipped ?? 0) + 1;
       if (!this.skipsSaid.has(e.why)) { this.skipsSaid.add(e.why); clientLog.add("warn", `skipped: ${e.why}`); }
@@ -1135,7 +1239,7 @@ class DieselSettingTab extends PluginSettingTab {
       .addText((t) => t.setValue(s.baseUrlPattern).onChange(async (v) => { s.baseUrlPattern = v.trim(); await save(); }));
     new Setting(containerEl).setName("Base URL overrides").setDesc("One per line: realm = https://host")
       .addTextArea((t) => t.setValue(s.baseUrlOverrides).onChange(async (v) => { s.baseUrlOverrides = v; await save(); }));
-    containerEl.createEl("h3", { text: "d2 (ai-putty.com)" });
+    containerEl.createEl("h3", { text: "d2 (aiputty.com)" });
     new Setting(containerEl).setName("Sync d1 reactors (dieselapps.com)")
       .setDesc("Off: only the d2 projects below sync. Notes of d1 realms, and notes last synced with d1 in a folder that is now " +
         "a d2 project, are left alone: nothing read, written or deleted.")

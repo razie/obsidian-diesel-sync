@@ -21,7 +21,7 @@ Obsidian plugin for two-way sync between notes and topics on [DieselApps](https:
   `RazInvest/Cards | metals.CompanyCard | Card- | card`
 - Base URL pattern `https://{realm}.dieselapps.com`, with per-realm overrides.
 
-## d2 projects (ai-putty.com)
+## d2 projects (aiputty.com)
 
 Since 0.4.0 the plugin also syncs d2 projects, which have their own API. List them under **d2 projects**, one per line; `d2spec` is there by default:
 
@@ -31,8 +31,8 @@ Since 0.4.0 the plugin also syncs d2 projects, which have their own API. List th
 - Without a token, your **User** and **Password** are used (d2 accepts them like a log-in). A token is safer: it's limited to one project and a level, and you can revoke it without changing your password.
 - Their notes live under the root like realms, `Diesel/d2spec/Topic/Diesel2.md`. Sync all makes the folder and pulls the project's Topics the first time (the **Initial pull query**, `topic` by default).
 - d2's shared topics (Help and the AI skill, which every project shows from the base) aren't synced into a project.
-- The **Base URL pattern** is for d1 reactors only; d2 projects use the **d2 URL pattern** (`https://{realm}.ai-putty.com`). A d1 pattern pointed at a d2 domain is put back to dieselapps.com on load.
-- d2 moved to ai-putty.com (0.8.0): on load, a d2 URL pattern, overrides and synced-note hosts still on aiheroapps.com, aiputty.com or aidieselapps.com are moved to ai-putty.com (the old domains only redirect).
+- The **Base URL pattern** is for d1 reactors only; d2 projects use the **d2 URL pattern** (`https://{realm}.aiputty.com`). A d1 pattern pointed at a d2 domain is put back to dieselapps.com on load.
+- d2 is aiputty.com (0.10.0; 0.8.0 had moved it to ai-putty.com, which now only redirects there): on load, a d2 URL pattern, overrides and synced-note hosts still on ai-putty.com, aiheroapps.com or aidieselapps.com are moved to aiputty.com (the old domains only redirect, and drop the login on the way).
 
 ## Commands
 
@@ -79,7 +79,7 @@ The plugin keeps its own rolling log (the last 800 lines, in its folder as `log.
 
 **Sync d1 reactors (dieselapps.com)** (setting, on): turn it off to sync only the **d2 projects**. Nothing of a d1 realm is read, written, queried or deleted — its notes just stay. A folder that moved from d1 to d2 (e.g. `metals`) keeps its old d1 notes safe: a note records the reactor it was last synced with; a link older than 0.7.0 is adopted if d2 has the topic and otherwise left alone (a d1 category d2 doesn't have, or a topic d2 doesn't have, is never deleted or recreated). The sync notice counts them as "d1 (left alone)". Test: `npm run test:d1off` (offline).
 
-The base project `d2` lives on the bare domain: its URL is `https://ai-putty.com`, not `d2.ai-putty.com` (0.7.1), so its links open where you're logged in.
+The base project `d2` lives on the bare domain: its URL is `https://aiputty.com`, not `d2.aiputty.com` (0.7.1), so its links open where you're logged in.
 
 ## Skipped, not errors (0.8.1)
 
@@ -87,4 +87,14 @@ What a sync leaves out on purpose is counted as **skipped** and said once in the
 
 ## Pop-ups only for what's new (0.8.2)
 
-An auto-sync no longer pops the same notice every interval. It notices only what the previous sync didn't have: a new error, conflict or leftover-marker note (keyed by note and status), a new pull, a delete or a kept note. A failure that repeats unchanged is shown once, then counted in the status bar (`… · 1 error (repeating)`) and logged as before; it notices again once that note has synced clean and the failure comes back, or once a day while it lasts. The repeats are kept in the plugin's data, so a restart doesn't re-notify. A realm that refuses the login gets one notice a day naming the fix (*make a new token at https://<realm>.ai-putty.com/ai/tokens*). A d1 realm that d2 also has as a project (d2's health names it) gets one notice a day saying to add it to **d2 projects**: nothing is moved, since the two copies may differ. A manual **Sync all** always shows its summary. `npm test` runs the offline tests (drafts, deletes, d1off, skips).
+An auto-sync no longer pops the same notice every interval. It notices only what the previous sync didn't have: a new error, conflict or leftover-marker note (keyed by note and status), a new pull, a delete or a kept note. A failure that repeats unchanged is shown once, then counted in the status bar (`… · 1 error (repeating)`) and logged as before; it notices again once that note has synced clean and the failure comes back, or once a day while it lasts. The repeats are kept in the plugin's data, so a restart doesn't re-notify. A realm that refuses the login gets one notice a day naming the fix (*make a new token at https://<realm>.aiputty.com/ai/tokens*). A d1 realm that d2 also has as a project (d2's health names it) gets one notice a day saying to add it to **d2 projects**: nothing is moved, since the two copies may differ. A manual **Sync all** always shows its summary. `npm test` runs the offline tests (drafts, deletes, d1off, skips, v2).
+
+## Only today's d2 routes; stop, don't poll (0.10.0)
+
+The plugin calls only d2's `/api/v2` routes: a topic `GET /api/v2/topics/<t>?format=json`, a draft `GET`/`PUT /api/v2/drafts/<t>` (with `If-Match`), the project's topic list `GET /api/v2/d2/Topic?fields=name,category,tags&limit=100&after=<next>`, every page (it was `GET /api/v2/topics`, deprecated, and only its first 100 read), the log `POST /api/v2/logs/client` and `GET /api/v2/health`. d1 reactors (dieselapps.com) keep d1's own `/api/v1/wiki/…`: d1 has no v2. A v1 call is never sent to a d2 host: a d1 realm whose URL is on aiputty.com (or an old d2 domain) is stopped before the call, with a notice to list it under **d2 projects**.
+
+- **Stopped:** an answer no retry can fix stops its realm: a route d2 doesn't have (404 *no route …*, or *all routes are under /api/v2* for v1), anything gone (410), or a token or login d2 refuses (401 `E_AUTH`: the notice says where to make a new token). One notice says why; the stop is kept in the plugin's data, so auto-sync never calls that realm again, restarts included, until you **Sync all** by hand (or a command on one of its notes), or change its URL, token, user or password. A missing topic or draft (404 *no topic …*) isn't a stop; a 401 without a login (`E_PRIVATE`) keeps its daily notice.
+- **Backing off:** a realm answering 5xx is left out of auto-sync for 2, 4, 8… of its intervals (an hour at most), until it answers again.
+- **Change counters:** auto-sync re-lists a d2 project for new topics only when its topic counters (`GET /api/v2/revs`) moved since the last list.
+
+Test: `npm run test:v2` (offline, a fake d2 on 127.0.0.1).

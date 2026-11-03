@@ -20,7 +20,7 @@ const json = (status: number, j: any, headers: Record<string, string> = {}) => (
     if (m !== "GET") { topicWrites++; return json(500, { error: "a topic write" }); }
     const t = topics.get(k[1]); return t ? json(200, { name: k[1], text: t.text, ver: t.ver }) : json(404, { ok: false });
   }
-  if (path === "/api/v2/topics") return json(200, { data: [] });
+  if (path === "/api/v2/d2/Topic") return json(200, { data: [] });
   if ((k = /^\/api\/v2\/drafts\/(.+)$/.exec(path))) {
     const d = drafts.get(k[1]), etag = d ? `"d${d.dver}"` : `"none"`;
     if (m === "GET") return d ? json(200, { text: d.text, dver: d.dver, base: topics.get(k[1])?.ver ?? 0 }, { etag }) : json(404, { ok: false, error: { code: "E_NOT_FOUND" } });
@@ -50,7 +50,7 @@ const sync = async () => { const n = notices.length; await p.syncAll(); return n
   vault.files.set(A, "# A\n\none\ntwo from obsidian\n"); await sync();
   check("1 an edit makes a draft, not a topic version", drafts.get("A")?.text === "# A\n\none\ntwo from obsidian\n" && topics.get("A")!.ver === 1 && topicWrites === 0, JSON.stringify(drafts.get("A")));
   check("1b the state keeps the draft's version, ETag and hash", p.data.state[A].dver === 1 && p.data.state[A].etag === '"d1"' && !!p.data.state[A].dhash && p.data.state[A].ver === 1);
-  check("1c the status bar says draft pending, linking to the draft in d2", /1 drafted/.test(status.text) && p.statusLink === "https://proj.ai-putty.com/topics/A?draft=1", `${status.text} ${p.statusLink}`);
+  check("1c the status bar says draft pending, linking to the draft in d2", /1 drafted/.test(status.text) && p.statusLink === "https://proj.aiputty.com/topics/A?draft=1", `${status.text} ${p.statusLink}`);
   let puts = draftPuts; await sync();
   check("2 the note equals its draft: nothing pushed or pulled", draftPuts === puts && /1 draft pending/.test(status.text) && p.statusLink.endsWith("/topics/A?draft=1"), status.text);
   vault.files.set(A, "# A\n\none\ntwo from obsidian\nthree\n"); await sync();

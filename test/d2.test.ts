@@ -19,7 +19,7 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   check("2 byte-identical", vault.files.get(`Diesel/${PROJ}/Topic/Welcome.md`)?.length! > 50);
   check("3 only Topics (no Spec:, no shared Help)", !pulled.some(k => /\/(Help|Skill)/.test(k)));
   // 0.9.0: a local edit goes to d2 as a draft; publishing it there makes the topic
-  const publish = (n: string) => fetch(`https://${PROJ}.ai-putty.com/api/v2/drafts/${n}/publish`, { method: "POST", headers: { Authorization: "Bearer " + TOKEN } });
+  const publish = (n: string) => fetch(`https://${PROJ}.aiputty.com/api/v2/drafts/${n}/publish`, { method: "POST", headers: { Authorization: "Bearer " + TOKEN } });
   const PA = `Diesel/${PROJ}/Topic/t-obsidian.md`;
   vault.files.set(PA, "# From Obsidian\n\nline one\n"); await p.syncAll();
   let d = await p.getDraft(`${PROJ}.Topic:t-obsidian`);
@@ -36,11 +36,11 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   const HP = `Diesel/${PROJ}/Topic/Help.md`; vault.files.set(HP, "# mine\n");
   await p.syncAll();
   const err7 = await p.getRemote(`${PROJ}.Topic:Help`).then(() => "", (e: Error) => e.message);
-  const own = (await (await fetch(`https://${PROJ}.ai-putty.com/api/v2/topics`, { headers: { Authorization: "Bearer " + TOKEN } })).json() as any).data.map((t: any) => t.name);
+  const own = (await p.listTopics(PROJ)).map((t) => t.name);
   check("7 a shared topic (d2's Help) is refused, not copied into the project", /shared topic/.test(err7) && !own.includes("Help"), err7);
   vault.files.delete(HP); delete p.data.state[HP];
   // 8-9 (0.5.0): a topic deleted in d2 takes its unedited note along; an edited note is kept
-  const del = (n: string) => fetch(`https://${PROJ}.ai-putty.com/api/v2/topics/Topic:${n}`, { method: "DELETE", headers: { Authorization: "Bearer " + TOKEN } });
+  const del = (n: string) => fetch(`https://${PROJ}.aiputty.com/api/v2/topics/Topic:${n}`, { method: "DELETE", headers: { Authorization: "Bearer " + TOKEN } });
   const PB = `Diesel/${PROJ}/Topic/t-obsidian-b.md`;
   vault.files.set(PB, "# B\n"); await p.syncAll(); await publish("t-obsidian-b"); await p.syncAll();
   check("8a both notes are linked", !!p.data.state[PA] && !!p.data.state[PB]);
@@ -51,11 +51,11 @@ const check = (n: string, ok: boolean, x = "") => { ok ? pass++ : fail++; consol
   vault.files.delete(PB); delete p.data.state[PB];
   // 10-11 (0.6.0): the plugin's log goes to d2's detailed log, with d2's request ids and no secrets
   const { clientLog } = await import("../src/main");
-  check("10a reactor calls are logged with d2's request id", clientLog.lines.some((l: any) => /GET .*ai-putty\.com\/api\/v2\/topics/.test(l.msg) && /^[0-9a-f]{12}$/.test(l.rid ?? "")));
+  check("10a reactor calls are logged with d2's request id", clientLog.lines.some((l: any) => /GET .*aiputty\.com\/api\/v2\/topics/.test(l.msg) && /^[0-9a-f]{12}$/.test(l.rid ?? "")));
   const marker = `upload-marker-${Date.now()}`; clientLog.add("warn", `${marker} Bearer ${TOKEN}`);
   Object.assign(p.data.settings, { logProject: PROJ, deviceName: "test-runner" });
   const sent = await p.uploadLog();
-  const got = (await (await fetch(`https://${PROJ}.ai-putty.com/api/v2/logs?kind=client&tests=1&text=${marker}`, { headers: { Authorization: "Bearer " + TOKEN } })).json() as any).data;
+  const got = (await (await fetch(`https://${PROJ}.aiputty.com/api/v2/logs?kind=client&tests=1&text=${marker}`, { headers: { Authorization: "Bearer " + TOKEN } })).json() as any).data;
   check("10 the log is uploaded to d2's detailed log", /log lines sent/.test(sent) && got.length === 1 && got[0].device === "test-runner" && got[0].source === "obsidian-diesel-sync", sent);
   check("11 no token in it", !JSON.stringify(got).includes(TOKEN!) && got[0].msg.includes("Bearer ***"));
   check("11b only new lines next time", await p.uploadLog() === "nothing new in the log");
